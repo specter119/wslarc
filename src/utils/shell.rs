@@ -3,6 +3,7 @@ use console::style;
 use log::{debug, trace};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::thread;
 
 pub fn run(cmd: &str, args: &[&str]) -> Result<String> {
     debug!("Executing: {} {}", cmd, args.join(" "));
@@ -37,14 +38,31 @@ pub fn run_with_output(cmd: &str, args: &[&str]) -> Result<()> {
         .spawn()
         .with_context(|| format!("Failed to spawn: {} {}", cmd, args.join(" ")))?;
 
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            println!("  {}", line);
-        }
-    }
+    let stdout_handle = child.stdout.take().map(|stdout| {
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().flatten() {
+                println!("  {}", line);
+            }
+        })
+    });
+
+    let stderr_handle = child.stderr.take().map(|stderr| {
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().flatten() {
+                eprintln!("  {}", line);
+            }
+        })
+    });
 
     let status = child.wait()?;
+    if let Some(handle) = stdout_handle {
+        let _ = handle.join();
+    }
+    if let Some(handle) = stderr_handle {
+        let _ = handle.join();
+    }
     if !status.success() {
         bail!("Command failed: {} {}", cmd, args.join(" "));
     }

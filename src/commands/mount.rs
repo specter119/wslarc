@@ -314,7 +314,8 @@ fn setup_ext4_sync(config: &Config, dry_run: bool) -> Result<()> {
     write_systemd_unit(&mount_unit_name, &mount_unit, dry_run)?;
     success(&format!("{} created", mount_unit_name));
 
-    let hook = ext4_sync::generate_pacman_hook();
+    let hook_targets = ext4_sync::collect_hook_targets()?;
+    let hook = ext4_sync::generate_pacman_hook(&hook_targets);
     write_file(PACMAN_HOOK_PATH, &hook, dry_run)?;
     success("pacman hook created");
 

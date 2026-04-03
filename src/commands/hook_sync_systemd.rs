@@ -1,19 +1,25 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
+use std::collections::HashSet;
+use std::io::Read;
 use std::process::Command;
 
 use crate::config::Config;
 use crate::generators::ext4_sync;
-use crate::utils::prompt::{info, success};
+use crate::utils::prompt::{info, success, warn};
 use crate::utils::shell::run_or_dry;
-
-const PACKAGES: &[&str] = &["systemd", "systemd-libs", "systemd-sysvcompat"];
 
 pub fn run(config: &Config, dry_run: bool) -> Result<()> {
     let mount_point = &config.ext4_sync.mount_point;
 
     ensure_mounted(mount_point, dry_run)?;
 
-    let versions = get_package_versions()?;
+    let triggered = read_triggered_packages();
+    if !triggered.is_empty() {
+        info(&format!("Triggered by: {}", triggered.join(", ")));
+    }
+
+    let packages = ext4_sync::collect_hook_targets()?;
+    let versions = get_package_versions(&packages)?;
 
     sync_cache(mount_point, &versions, dry_run)?;
 
@@ -48,13 +54,33 @@ fn ensure_mounted(mount_point: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn get_package_versions() -> Result<Vec<(String, String)>> {
+fn read_triggered_packages() -> Vec<String> {
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return Vec::new();
+    }
+
+    let mut packages = HashSet::new();
+    for line in input.lines() {
+        let name = line.trim();
+        if !name.is_empty() {
+            packages.insert(name.to_string());
+        }
+    }
+
+    let mut list: Vec<String> = packages.into_iter().collect();
+    list.sort();
+    list
+}
+
+fn get_package_versions(packages: &[String]) -> Result<Vec<(String, String)>> {
     let mut versions = Vec::new();
-    for pkg in PACKAGES {
+    for pkg in packages {
         let output = Command::new("pacman").args(["-Q", pkg]).output()?;
 
         if !output.status.success() {
-            bail!("Package {} not installed", pkg);
+            warn(&format!("Package {} not installed, skipping", pkg));
+            continue;
         }
 
         let line = String::from_utf8_lossy(&output.stdout);
@@ -92,6 +118,11 @@ fn sync_cache(mount_point: &str, versions: &[(String, String)], dry_run: bool) -
 
 fn install_packages(mount_point: &str, versions: &[(String, String)], dry_run: bool) -> Result<()> {
     let arch = std::env::consts::ARCH;
+
+    if versions.is_empty() {
+        info("No packages to sync");
+        return Ok(());
+    }
 
     let pkg_paths: Vec<String> = versions
         .iter()

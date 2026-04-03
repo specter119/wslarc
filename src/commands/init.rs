@@ -54,7 +54,7 @@ pub fn run(config: &Config, yes: bool, dry_run: bool) -> Result<()> {
     info(&format!("Device: {}", device));
 
     step(3, total_steps, "Format as Btrfs");
-    format_btrfs(&cfg, &device, dry_run, yes)?;
+    format_btrfs(&mut cfg, &device, dry_run, yes)?;
 
     step(4, total_steps, "Get filesystem UUID");
     let uuid = get_uuid(&device, dry_run)?;
@@ -211,7 +211,7 @@ fn mount_vhdx(cfg: &Config, dry_run: bool) -> Result<String> {
 }
 
 /// Format device as Btrfs
-fn format_btrfs(cfg: &Config, device: &str, dry_run: bool, yes: bool) -> Result<()> {
+fn format_btrfs(cfg: &mut Config, device: &str, dry_run: bool, yes: bool) -> Result<()> {
     if dry_run {
         info("[dry-run] Would format as Btrfs");
         return Ok(());
@@ -250,6 +250,15 @@ fn format_btrfs(cfg: &Config, device: &str, dry_run: bool, yes: bool) -> Result<
         if !confirm_or_yes("Continue with this device anyway?", false, yes)? {
             bail!("Aborted due to label mismatch");
         }
+        if !current_label.is_empty() && current_label != cfg.vhdx.label {
+            warn(&format!(
+                "Using existing label '{}' and updating config",
+                current_label
+            ));
+            cfg.vhdx.label = current_label.to_string();
+        } else if current_label.is_empty() {
+            warn("Device label is empty; attach by label may fail until you set a label.");
+        }
         return Ok(());
     }
 
@@ -281,10 +290,10 @@ fn create_subvolumes(cfg: &Config, device: &str, dry_run: bool) -> Result<()> {
     // Mount device
     if !dry_run {
         fs::create_dir_all(mount_point)?;
-        shell_run("mount", &[device, mount_point])?;
+        shell_run("mount", &["-o", "subvolid=5", device, mount_point])?;
     } else {
         info(&format!(
-            "[dry-run] Would mount {} to {}",
+            "[dry-run] Would mount {} to {} (subvolid=5)",
             device, mount_point
         ));
     }

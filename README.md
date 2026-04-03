@@ -1,4 +1,4 @@
-# wslarc
+# WSLArc
 
 WSL2 Btrfs backup and restore tool.
 
@@ -137,11 +137,11 @@ timer_schedule = "*-*-* 03:00:00"
 
 ## Subvolume Classes
 
-| Class | Purpose | Snapshot | nodatacow |
-|-------|---------|----------|-----------|
-| A | Backup targets | ✓ | - |
-| B | Excluded paths | Nested under A | - |
-| C | High I/O transfer | ✗ | Optional |
+| Class | Purpose           | Snapshot       | nodatacow |
+| ----- | ----------------- | -------------- | --------- |
+| A     | Backup targets    | ✓              | -         |
+| B     | Excluded paths    | Nested under A | -         |
+| C     | High I/O transfer | ✗              | Optional  |
 
 ## License
 
