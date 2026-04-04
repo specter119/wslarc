@@ -1,10 +1,10 @@
 use anyhow::Result;
 use std::collections::HashSet;
 use std::io::Read;
-use std::process::Command;
 
 use crate::config::Config;
 use crate::generators::ext4_sync;
+use crate::utils::cli::{is_mountpoint, pacman_query_version};
 use crate::utils::prompt::{info, success, warn};
 use crate::utils::shell::run_or_dry;
 
@@ -30,14 +30,7 @@ pub fn run(config: &Config, dry_run: bool) -> Result<()> {
 }
 
 fn ensure_mounted(mount_point: &str, dry_run: bool) -> Result<()> {
-    let is_mounted = Command::new("mountpoint")
-        .arg("-q")
-        .arg(mount_point)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if is_mounted {
+    if is_mountpoint(mount_point) {
         info(&format!("{} already mounted", mount_point));
         return Ok(());
     }
@@ -76,17 +69,10 @@ fn read_triggered_packages() -> Vec<String> {
 fn get_package_versions(packages: &[String]) -> Result<Vec<(String, String)>> {
     let mut versions = Vec::new();
     for pkg in packages {
-        let output = Command::new("pacman").args(["-Q", pkg]).output()?;
-
-        if !output.status.success() {
+        if let Some(version) = pacman_query_version(pkg)? {
+            versions.push((pkg.to_string(), version));
+        } else {
             warn(&format!("Package {} not installed, skipping", pkg));
-            continue;
-        }
-
-        let line = String::from_utf8_lossy(&output.stdout);
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            versions.push((pkg.to_string(), parts[1].to_string()));
         }
     }
     Ok(versions)

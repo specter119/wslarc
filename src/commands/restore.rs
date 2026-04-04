@@ -3,6 +3,7 @@ use console::style;
 use std::path::Path;
 
 use crate::config::Config;
+use crate::utils::cli::{is_mountpoint, list_directory_names};
 use crate::utils::prompt::{confirm_or_yes, info, section, select, step, success, warn};
 use crate::utils::shell::run as shell_run;
 
@@ -13,22 +14,25 @@ pub fn run(config: &Config, snapshot: Option<String>, yes: bool) -> Result<()> {
     let snapshot_dir = format!("{}/{}", config.mount.base, config.btrbk.snapshot_dir);
 
     // Get available snapshots
-    let snapshots = shell_run("ls", &["-1", &snapshot_dir])?;
-    if snapshots.is_empty() {
+    let snapshot_list = list_directory_names(&snapshot_dir)?;
+    if snapshot_list.is_empty() {
         bail!("No snapshots found in {}", snapshot_dir);
     }
 
-    let snapshot_list: Vec<&str> = snapshots.lines().collect();
-
     // Select snapshot
     let selected = if let Some(ref name) = snapshot {
-        if !snapshot_list.contains(&name.as_str()) {
+        if !snapshot_list.contains(name) {
             bail!("Snapshot '{}' not found", name);
         }
         name.clone()
     } else {
         // Interactive selection
-        let options: Vec<&str> = snapshot_list.iter().rev().take(10).cloned().collect();
+        let options: Vec<&str> = snapshot_list
+            .iter()
+            .rev()
+            .take(10)
+            .map(|s| s.as_str())
+            .collect();
         let idx = select("Select snapshot to restore", &options, 0)?;
         options[idx].to_string()
     };
@@ -101,8 +105,7 @@ pub fn run(config: &Config, snapshot: Option<String>, yes: bool) -> Result<()> {
         step(current_step, total_steps, &format!("Unmount {}", mp));
 
         // Check if mounted
-        let mounts = shell_run("mount", &[]).unwrap_or_default();
-        if mounts.contains(&format!(" {} ", mp)) || mounts.contains(&format!(" {}\n", mp)) {
+        if is_mountpoint(mp) {
             // Try to unmount
             match shell_run("umount", &[mp]) {
                 Ok(_) => success("Unmounted successfully"),

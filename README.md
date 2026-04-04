@@ -43,6 +43,24 @@ tar xzf wslarc-linux-x86_64.tar.gz
 sudo mv wslarc /usr/local/bin/
 ```
 
+## Runtime Dependencies
+
+Beyond a basic Arch/WSL environment, `wslarc` checks the dependencies actually required by each command:
+
+- `wslarc init`
+  - Required: `btrfs-progs`, `rsync`
+  - Conditional: if any transfer subvolume sets `nodatacow = true`, `e2fsprogs` is required for `chattr`
+- `wslarc mount`
+  - Required: `btrbk`
+- `wslarc snapshot run` / `wslarc snapshot list`
+  - Required: `btrbk`
+
+Install them with:
+
+```bash
+sudo pacman -S btrfs-progs rsync btrbk e2fsprogs
+```
+
 ## Usage
 
 ### Initialize Btrfs VHDX
@@ -80,6 +98,18 @@ sudo wslarc snapshot run
 # List snapshots
 wslarc snapshot list
 ```
+
+## Status Behavior
+
+- `Subvolumes`
+  - When the system allows reading the live Btrfs subvolume list, `wslarc` shows the actual subvolumes
+  - When `/mnt/btrfs` is mounted but `btrfs subvolume list` fails because of permissions or capability limits, `wslarc` shows:
+    - `mounted`
+    - the failure reason
+    - a subvolume overview derived from configuration
+- `Failed mounts`
+  - Only checks mount units managed by `wslarc`
+  - Does not scan every failed mount unit on the system
 
 ## Configuration
 

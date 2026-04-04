@@ -41,7 +41,7 @@ pub fn run_with_output(cmd: &str, args: &[&str]) -> Result<()> {
     let stdout_handle = child.stdout.take().map(|stdout| {
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 println!("  {}", line);
             }
         })
@@ -50,7 +50,7 @@ pub fn run_with_output(cmd: &str, args: &[&str]) -> Result<()> {
     let stderr_handle = child.stderr.take().map(|stderr| {
         thread::spawn(move || {
             let reader = BufReader::new(stderr);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 eprintln!("  {}", line);
             }
         })

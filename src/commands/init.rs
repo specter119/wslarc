@@ -4,6 +4,10 @@ use std::fs;
 use std::path::Path;
 
 use crate::config::Config;
+use crate::utils::cli::{
+    ensure_dependencies, find_btrfs_device_by_label, is_mountpoint, list_block_device_names,
+    read_block_device, Dependency,
+};
 use crate::utils::prompt::{self, confirm_or_yes, info, input, step, success, warn};
 use crate::utils::shell::{run as shell_run, run_or_dry};
 
@@ -34,6 +38,8 @@ pub fn run(config: &Config, yes: bool, dry_run: bool) -> Result<()> {
     if cfg.user.name.is_empty() {
         bail!("User is required. Set it in config file or run without --yes for interactive mode.");
     }
+
+    check_runtime_dependencies(&cfg)?;
 
     // Show summary
     show_summary(&cfg);
@@ -85,6 +91,24 @@ pub fn run(config: &Config, yes: bool, dry_run: bool) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn check_runtime_dependencies(config: &Config) -> Result<()> {
+    let mut dependencies = vec![
+        Dependency::new("btrfs-progs", &["mkfs.btrfs", "btrfs"]),
+        Dependency::new("rsync", &["rsync"]),
+    ];
+
+    if config
+        .subvolumes
+        .transfer
+        .values()
+        .any(|transfer| transfer.nodatacow)
+    {
+        dependencies.push(Dependency::new("e2fsprogs", &["chattr"]));
+    }
+
+    ensure_dependencies(&dependencies)
 }
 
 /// Interactive configuration collection
@@ -170,22 +194,16 @@ fn mount_vhdx(cfg: &Config, dry_run: bool) -> Result<String> {
     }
 
     // Check if VHDX is already mounted (by label)
-    let existing = shell_run("lsblk", &["-n", "-o", "NAME,LABEL"]).unwrap_or_default();
-    for line in existing.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 && parts[1] == cfg.vhdx.label {
-            let device = format!("/dev/{}", parts[0]);
-            success(&format!(
-                "Already mounted as {} (label: {})",
-                device, cfg.vhdx.label
-            ));
-            return Ok(device);
-        }
+    if let Some(device) = find_btrfs_device_by_label(&cfg.vhdx.label)? {
+        success(&format!(
+            "Already mounted as {} (label: {})",
+            device, cfg.vhdx.label
+        ));
+        return Ok(device);
     }
 
     // Get current block devices
-    let before = shell_run("lsblk", &["-d", "-n", "-o", "NAME"])?;
-    let before_devs: Vec<&str> = before.lines().collect();
+    let before_devs = list_block_device_names()?;
 
     // Mount VHDX
     // Normalize path: wsl.exe accepts both / and \, but we standardize to \
@@ -198,11 +216,11 @@ fn mount_vhdx(cfg: &Config, dry_run: bool) -> Result<String> {
 
     // Find the new device
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let after = shell_run("lsblk", &["-d", "-n", "-o", "NAME"])?;
+    let after_devs = list_block_device_names()?;
 
-    let new_dev = after
-        .lines()
-        .find(|d| !before_devs.contains(d))
+    let new_dev = after_devs
+        .iter()
+        .find(|device| !before_devs.contains(device))
         .ok_or_else(|| anyhow::anyhow!("Could not find new device after mounting VHDX"))?;
 
     let device = format!("/dev/{}", new_dev);
@@ -218,12 +236,15 @@ fn format_btrfs(cfg: &mut Config, device: &str, dry_run: bool, yes: bool) -> Res
     }
 
     // Check if already formatted
-    let fstype = shell_run("lsblk", &["-n", "-o", "FSTYPE", device]).unwrap_or_default();
+    let block_device = read_block_device(device)?.unwrap_or(crate::utils::cli::BlockDevice {
+        name: device.trim_start_matches("/dev/").to_string(),
+        label: None,
+        fstype: None,
+    });
 
-    if fstype.trim() == "btrfs" {
+    if block_device.fstype.as_deref() == Some("btrfs") {
         // Check label
-        let current_label = shell_run("lsblk", &["-n", "-o", "LABEL", device]).unwrap_or_default();
-        let current_label = current_label.trim();
+        let current_label = block_device.label.as_deref().unwrap_or("");
 
         if current_label == cfg.vhdx.label {
             success(&format!(
@@ -469,10 +490,7 @@ fn mount_base(cfg: &Config, device: &str, dry_run: bool) -> Result<()> {
     let mount_point = &cfg.mount.base;
 
     // Check if already mounted
-    let mounts = shell_run("mount", &[]).unwrap_or_default();
-    if mounts.contains(&format!(" {} ", mount_point))
-        || mounts.contains(&format!(" {}\n", mount_point))
-    {
+    if is_mountpoint(mount_point) {
         success(&format!("{} already mounted", mount_point));
         return Ok(());
     }

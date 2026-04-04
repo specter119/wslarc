@@ -6,6 +6,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::generators::{btrbk, ext4_sync, systemd};
+use crate::utils::cli::{ensure_dependencies, Dependency};
 use crate::utils::prompt::{confirm_or_yes, info, step, success, warn};
 use crate::utils::shell::run_or_dry;
 
@@ -25,6 +26,8 @@ pub fn run(config: &Config, yes: bool, dry_run: bool) -> Result<()> {
     if config.uuid.is_none() {
         bail!("UUID not set. Run 'wslarc init' first.");
     }
+
+    ensure_dependencies(&[Dependency::new("btrbk", &["btrbk"])])?;
 
     let needs_ext4_sync = has_usr_subvol(config);
 

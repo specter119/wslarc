@@ -7,20 +7,11 @@ use anyhow::Result;
 use std::process::Command;
 
 use crate::config::Config;
+use crate::utils::cli::find_btrfs_device_by_label;
 
 /// Check if a Btrfs filesystem with the given label is available
 fn is_btrfs_available(label: &str) -> bool {
-    Command::new("lsblk")
-        .args(["-f", "-n", "-o", "FSTYPE,LABEL"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|output| {
-            output
-                .lines()
-                .any(|line| line.contains("btrfs") && line.contains(label))
-        })
-        .unwrap_or(false)
+    find_btrfs_device_by_label(label).unwrap_or(None).is_some()
 }
 
 /// Ensure binfmt_misc is configured so wsl.exe can be executed
