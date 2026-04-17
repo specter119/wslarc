@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::io::Read;
 
@@ -18,7 +18,7 @@ pub fn run(config: &Config, dry_run: bool) -> Result<()> {
         info(&format!("Triggered by: {}", triggered.join(", ")));
     }
 
-    let packages = ext4_sync::collect_hook_targets()?;
+    let packages = select_sync_packages(&triggered)?;
     let versions = get_package_versions(&packages)?;
 
     sync_cache(mount_point, &versions, dry_run)?;
@@ -66,6 +66,27 @@ fn read_triggered_packages() -> Vec<String> {
     list
 }
 
+fn select_sync_packages(triggered: &[String]) -> Result<Vec<String>> {
+    let hook_targets = ext4_sync::collect_hook_targets()?;
+    Ok(filter_sync_packages(triggered, &hook_targets))
+}
+
+fn filter_sync_packages(triggered: &[String], hook_targets: &[String]) -> Vec<String> {
+    if triggered.is_empty() {
+        return hook_targets.to_vec();
+    }
+
+    let allowed: HashSet<&str> = hook_targets.iter().map(String::as_str).collect();
+    let mut packages: Vec<String> = triggered
+        .iter()
+        .filter(|pkg| allowed.contains(pkg.as_str()))
+        .cloned()
+        .collect();
+    packages.sort();
+    packages.dedup();
+    packages
+}
+
 fn get_package_versions(packages: &[String]) -> Result<Vec<(String, String)>> {
     let mut versions = Vec::new();
     for pkg in packages {
@@ -95,7 +116,9 @@ fn sync_cache(mount_point: &str, versions: &[(String, String)], dry_run: bool) -
         if dry_run {
             info(&format!("[dry-run] Would copy {} to {}", src, dst));
         } else {
-            std::fs::copy(&src, &dst)?;
+            std::fs::copy(&src, &dst)
+                .map_err(anyhow::Error::from)
+                .with_context(|| format!("Failed to copy cached package {}", src))?;
             info(&format!("Copied {}", pkg_file));
         }
     }
@@ -127,4 +150,58 @@ fn install_packages(mount_point: &str, versions: &[(String, String)], dry_run: b
 
     run_or_dry("pacman", &args, dry_run)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_hook_targets() -> Vec<String> {
+        vec![
+            "systemd".to_string(),
+            "libgcrypt".to_string(),
+            "glibc".to_string(),
+        ]
+    }
+
+    #[test]
+    fn filter_sync_packages_uses_triggered_targets_only() {
+        let packages = filter_sync_packages(
+            &["libgcrypt".to_string(), "not-a-target".to_string()],
+            &sample_hook_targets(),
+        );
+
+        assert_eq!(packages, vec!["libgcrypt".to_string()]);
+    }
+
+    #[test]
+    fn filter_sync_packages_falls_back_to_all_targets_without_stdin() {
+        let packages = filter_sync_packages(&[], &sample_hook_targets());
+
+        assert!(packages.iter().any(|pkg| pkg == "systemd"));
+        assert!(packages.iter().any(|pkg| pkg == "libgcrypt"));
+    }
+
+    #[test]
+    fn filter_sync_packages_sorts_dedups_and_discards_unknowns() {
+        let packages = filter_sync_packages(
+            &[
+                "libgcrypt".to_string(),
+                "systemd".to_string(),
+                "libgcrypt".to_string(),
+                "unknown".to_string(),
+                "glibc".to_string(),
+            ],
+            &sample_hook_targets(),
+        );
+
+        assert_eq!(
+            packages,
+            vec![
+                "glibc".to_string(),
+                "libgcrypt".to_string(),
+                "systemd".to_string(),
+            ]
+        );
+    }
 }

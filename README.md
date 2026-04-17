@@ -86,6 +86,8 @@ sudo wslarc mount
 sudo wslarc mount --dry-run
 ```
 
+`wslarc mount` also installs a pacman hook that syncs triggered systemd-related package upgrades into the ext4 root sysroot used by WSL.
+
 ### Status and snapshots
 
 ```bash
