@@ -6,11 +6,23 @@ use crate::utils::cli::{ensure_dependencies, list_directory_names, Dependency};
 use crate::utils::prompt::{info, success};
 use crate::utils::shell::{run as shell_run, run_with_output};
 
-pub fn run(_config: &Config) -> Result<()> {
+pub fn run(config: &Config) -> Result<()> {
     println!("{}", style("Creating Btrfs Snapshot").bold().cyan());
     println!();
 
-    ensure_dependencies(&[Dependency::new("btrbk", &["btrbk"])])?;
+    ensure_dependencies(&[
+        Dependency::new("btrbk", &["btrbk"]),
+        Dependency::new("rsync", &["rsync"]),
+    ])?;
+
+    // Sync /etc to @etc before snapshot
+    info("Syncing /etc to @etc...");
+    let etc_target = format!("{}/{}", config.mount.base, "@etc");
+    run_with_output(
+        "rsync",
+        &["-aAX", "--delete", "/etc/", &format!("{}/", etc_target)],
+    )?;
+    success("/etc synced to @etc");
 
     info("Running btrbk...");
     run_with_output("btrbk", &["-v", "run"])?;
