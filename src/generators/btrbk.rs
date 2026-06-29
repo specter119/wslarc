@@ -127,12 +127,7 @@ mod tests {
                 },
                 transfer: HashMap::new(),
             },
-            btrbk: BtrbkConfig {
-                snapshot_dir: ".snapshots".to_string(),
-                preserve_min: "2d".to_string(),
-                preserve: "14d 4w 2m".to_string(),
-                timer_schedule: "*-*-* 03:00:00".to_string(),
-            },
+            btrbk: BtrbkConfig::default(),
             ext4_sync: Ext4SyncConfig::default(),
             uuid: Some("12345678-1234-1234-1234-123456789abc".to_string()),
         }
@@ -146,8 +141,8 @@ mod tests {
         assert!(output.contains("# /etc/btrbk/btrbk.conf"));
         assert!(output.contains("volume /mnt/btrfs"));
         assert!(output.contains("snapshot_dir .snapshots"));
-        assert!(output.contains("snapshot_preserve_min   2d"));
-        assert!(output.contains("snapshot_preserve       14d 4w 2m"));
+        assert!(output.contains("snapshot_preserve_min   latest"));
+        assert!(output.contains("snapshot_preserve       2d 1w 2m"));
         assert!(output.contains("subvolume @etc"));
     }
 

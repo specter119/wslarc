@@ -139,12 +139,7 @@ mod tests {
                 },
                 transfer,
             },
-            btrbk: BtrbkConfig {
-                snapshot_dir: ".snapshots".to_string(),
-                preserve_min: "2d".to_string(),
-                preserve: "14d 4w 2m".to_string(),
-                timer_schedule: "*-*-* 03:00:00".to_string(),
-            },
+            btrbk: BtrbkConfig::default(),
             ext4_sync: Ext4SyncConfig::default(),
             uuid: Some("12345678-1234-1234-1234-123456789abc".to_string()),
         }

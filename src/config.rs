@@ -142,10 +142,21 @@ pub struct BtrbkConfig {
     pub snapshot_dir: String,
     /// Minimum preserve time
     pub preserve_min: String,
-    /// Preserve policy (e.g., "14d 4w 2m")
+    /// Preserve policy (e.g., "2d 1w 2m")
     pub preserve: String,
     /// Systemd timer schedule
     pub timer_schedule: String,
+}
+
+impl Default for BtrbkConfig {
+    fn default() -> Self {
+        Self {
+            snapshot_dir: ".snapshots".to_string(),
+            preserve_min: "latest".to_string(),
+            preserve: "2d 1w 2m".to_string(),
+            timer_schedule: "*-*-* 03:00:00".to_string(),
+        }
+    }
 }
 
 impl Config {
@@ -288,12 +299,7 @@ impl Default for Config {
                 },
                 transfer,
             },
-            btrbk: BtrbkConfig {
-                snapshot_dir: ".snapshots".to_string(),
-                preserve_min: "2d".to_string(),
-                preserve: "14d 4w 2m".to_string(),
-                timer_schedule: "*-*-* 03:00:00".to_string(),
-            },
+            btrbk: BtrbkConfig::default(),
             ext4_sync: Ext4SyncConfig::default(),
             uuid: None,
         }
@@ -314,6 +320,8 @@ mod tests {
         assert_eq!(cfg.vhdx.label, "ArchBtrfs");
         assert_eq!(cfg.mount.base, "/mnt/btrfs");
         assert!(cfg.mount.options.contains("compress=zstd:3"));
+        assert_eq!(cfg.btrbk.preserve_min, "latest");
+        assert_eq!(cfg.btrbk.preserve, "2d 1w 2m");
         assert!(cfg.uuid.is_none());
     }
 

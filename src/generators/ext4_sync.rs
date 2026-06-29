@@ -1,8 +1,9 @@
 use anyhow::Result;
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::config::Config;
 use crate::generators::systemd::path_to_unit_name;
-use crate::utils::cli::{find_mount_uuid, pacman_query_depends};
+use crate::utils::cli::{find_mount_uuid, pacman_query_depends, pacman_query_version};
 
 pub const SYSTEMD_PACKAGES: [&str; 3] = ["systemd", "systemd-libs", "systemd-sysvcompat"];
 
@@ -50,16 +51,36 @@ pub fn generate_pacman_hook(targets: &[String]) -> String {
 }
 
 pub fn collect_hook_targets() -> Result<Vec<String>> {
-    let mut targets = std::collections::HashSet::new();
+    collect_recursive_targets(&SYSTEMD_PACKAGES, pacman_query_depends, |pkg| {
+        Ok(pacman_query_version(pkg)?.is_some())
+    })
+}
 
-    for pkg in SYSTEMD_PACKAGES {
-        targets.insert(pkg.to_string());
-        targets.extend(pacman_query_depends(pkg)?);
+fn collect_recursive_targets<F, G>(
+    roots: &[&str],
+    mut deps_for: F,
+    mut is_installed: G,
+) -> Result<Vec<String>>
+where
+    F: FnMut(&str) -> Result<Vec<String>>,
+    G: FnMut(&str) -> Result<bool>,
+{
+    let mut queue: VecDeque<String> = roots.iter().map(|pkg| (*pkg).to_string()).collect();
+    let mut seen = BTreeSet::new();
+
+    while let Some(pkg) = queue.pop_front() {
+        if !seen.insert(pkg.clone()) {
+            continue;
+        }
+
+        for dep in deps_for(&pkg)? {
+            if !seen.contains(&dep) && is_installed(&dep)? {
+                queue.push_back(dep);
+            }
+        }
     }
 
-    let mut list: Vec<String> = targets.into_iter().collect();
-    list.sort();
-    Ok(list)
+    Ok(seen.into_iter().collect())
 }
 
 pub fn ext4_mount_unit_filename(config: &Config) -> String {
@@ -78,5 +99,56 @@ mod tests {
         assert!(hook.contains("Target = systemd"));
         assert!(hook.contains("Target = glibc"));
         assert!(hook.contains("NeedsTargets"));
+    }
+
+    #[test]
+    fn test_collect_recursive_targets_walks_transitive_dependencies() {
+        let targets = collect_recursive_targets(
+            &["systemd"],
+            |pkg| {
+                Ok(match pkg {
+                    "systemd" => vec!["liba".to_string(), "libb".to_string()],
+                    "liba" => vec!["libc".to_string()],
+                    _ => Vec::new(),
+                })
+            },
+            |_| Ok(true),
+        )
+        .unwrap();
+
+        assert_eq!(
+            targets,
+            vec![
+                "liba".to_string(),
+                "libb".to_string(),
+                "libc".to_string(),
+                "systemd".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_collect_recursive_targets_skips_uninstalled_and_cycles() {
+        let targets = collect_recursive_targets(
+            &["systemd-libs"],
+            |pkg| {
+                Ok(match pkg {
+                    "systemd-libs" => vec!["glibc".to_string(), "sh".to_string()],
+                    "glibc" => vec!["systemd-libs".to_string(), "libcap".to_string()],
+                    _ => Vec::new(),
+                })
+            },
+            |pkg| Ok(pkg != "sh"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            targets,
+            vec![
+                "glibc".to_string(),
+                "libcap".to_string(),
+                "systemd-libs".to_string(),
+            ]
+        );
     }
 }

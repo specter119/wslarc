@@ -133,7 +133,7 @@ fn collect_config(base: &Config) -> Result<Config> {
     println!("  A-class (backup): @usr, @opt, @home, @var_lib_pacman");
     println!("  Snapshot-only: @etc (not mounted, for btrbk backup)");
     println!("  B-class (exclude): .cache, .local, .npm, .bun, .vscode-server-insiders");
-    println!("  C-class (transfer): @containers, @containers_user, @var_cache, @var_log, @var_tmp");
+    println!("  C-class (transfer): @containers, @var_cache, @var_log, @var_tmp");
 
     Ok(cfg)
 }

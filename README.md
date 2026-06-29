@@ -7,7 +7,7 @@ WSL2 Btrfs backup and restore tool.
 - **Btrfs initialization**: Format VHDX and create subvolumes via interactive wizard
 - **Subvolume management**: A/B/C class subvolumes with different backup strategies
 - **Systemd integration**: Generate mount units and btrbk timer
-- **Snapshot management**: Create and list snapshots via btrbk
+- **Snapshot management**: Create, list, and restore snapshots via btrbk
 
 ## Prerequisites
 
@@ -52,7 +52,9 @@ Beyond a basic Arch/WSL environment, `wslarc` checks the dependencies actually r
   - Conditional: if any transfer subvolume sets `nodatacow = true`, `e2fsprogs` is required for `chattr`
 - `wslarc mount`
   - Required: `btrbk`
-- `wslarc snapshot run` / `wslarc snapshot list`
+- `wslarc snapshot run`
+  - Required: `btrbk`, `rsync`
+- `wslarc snapshot list`
   - Required: `btrbk`
 
 Install them with:
@@ -86,9 +88,16 @@ sudo wslarc mount
 sudo wslarc mount --dry-run
 ```
 
-`wslarc mount` also installs a pacman hook that syncs triggered systemd-related package upgrades into the ext4 root sysroot used by WSL.
+`wslarc mount` also installs a pacman hook that syncs triggered systemd-related package upgrades and their recursive dependency closure into the ext4 root sysroot used by WSL.
 
-### Status and snapshots
+### Disable wslarc mount units
+
+```bash
+# Disable wslarc-managed mounts and timer
+sudo wslarc unmount
+```
+
+### Status, snapshots, and restore
 
 ```bash
 # Show status
@@ -99,6 +108,12 @@ sudo wslarc snapshot run
 
 # List snapshots
 wslarc snapshot list
+
+# Restore interactively from a snapshot
+sudo wslarc restore
+
+# Restore a specific snapshot
+sudo wslarc restore --snapshot home.20260629T0323
 ```
 
 ## Status Behavior
@@ -126,6 +141,8 @@ label = "ArchBtrfs"
 [user]
 # Linux username (required, will be created if not exists)
 name = "yourname"
+# useradd options (default: "-M -G wheel")
+# options = "-M -G wheel"
 
 [mount]
 base = "/mnt/btrfs"
@@ -134,10 +151,13 @@ base = "/mnt/btrfs"
 
 # A-class: Backup targets (simple form)
 [subvolumes.backup]
-"@etc" = "/etc"
 "@usr" = "/usr"
 "@opt" = "/opt"
 "@home" = "/home/$USER"
+"@var_lib_pacman" = "/var/lib/pacman"
+
+# Snapshot-only subvolume
+# @etc is created automatically and synced from /etc before snapshots
 
 # A-class: Backup targets with custom options (full form)
 # [subvolumes.backup."@data"]
@@ -147,7 +167,7 @@ base = "/mnt/btrfs"
 # B-class: Excluded paths (nested subvolumes)
 [subvolumes.exclude]
 parent = "@home"
-paths = [".cache", ".local", ".npm", ".bun"]
+paths = [".cache", ".local", ".npm", ".bun", ".vscode-server-insiders"]
 
 # C-class: Transfer subvolumes (high I/O)
 [subvolumes.transfer."@containers"]
@@ -159,11 +179,19 @@ nodatacow = true
 mount = "/var/cache"
 nodatacow = true
 
+[subvolumes.transfer."@var_log"]
+mount = "/var/log"
+nodatacow = false
+
+[subvolumes.transfer."@var_tmp"]
+mount = "/var/tmp"
+nodatacow = true
+
 # btrbk configuration
 [btrbk]
 snapshot_dir = ".snapshots"
-preserve_min = "2d"
-preserve = "14d 4w 2m"
+preserve_min = "latest"
+preserve = "2d 1w 2m"
 timer_schedule = "*-*-* 03:00:00"
 ```
 
