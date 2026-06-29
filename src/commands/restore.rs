@@ -86,7 +86,7 @@ pub fn run(config: &Config, snapshot: Option<String>, yes: bool) -> Result<()> {
     warn("This will REPLACE the current subvolume with the snapshot!");
     warn("All changes since the snapshot will be LOST!");
     if mount_point.is_some() {
-        warn("The mount point must be unmounted during restore.");
+        warn("The mount point must be detached with umount during restore.");
     }
     println!();
 
@@ -99,28 +99,28 @@ pub fn run(config: &Config, snapshot: Option<String>, yes: bool) -> Result<()> {
     let total_steps = if mount_point.is_some() { 5 } else { 3 };
     let mut current_step = 0;
 
-    // Step 1: Unmount if needed
+    // Step 1: Umount if needed
     if let Some(ref mp) = mount_point {
         current_step += 1;
-        step(current_step, total_steps, &format!("Unmount {}", mp));
+        step(current_step, total_steps, &format!("Umount {}", mp));
 
         // Check if mounted
         if is_mountpoint(mp) {
-            // Try to unmount
+            // Try to umount
             match shell_run("umount", &[mp]) {
                 Ok(_) => success("Unmounted successfully"),
                 Err(e) => {
-                    warn(&format!("Failed to unmount: {}", e));
+                    warn(&format!("Failed to umount: {}", e));
                     warn("The mount point may be in use. Please close all programs using it.");
-                    if !confirm_or_yes("Retry unmount?", true, yes)? {
-                        bail!("Cannot proceed without unmounting {}", mp);
+                    if !confirm_or_yes("Retry umount?", true, yes)? {
+                        bail!("Cannot proceed without umount {}", mp);
                     }
-                    shell_run("umount", &["-l", mp])?; // Lazy unmount as fallback
-                    success("Lazy unmount completed");
+                    shell_run("umount", &["-l", mp])?; // Lazy umount as fallback
+                    success("Lazy umount completed");
                 }
             }
         } else {
-            info("Already unmounted");
+            info("Already not mounted");
         }
     }
 

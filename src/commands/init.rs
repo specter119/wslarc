@@ -322,7 +322,7 @@ fn create_subvolumes(cfg: &Config, device: &str, dry_run: bool) -> Result<()> {
     // Create subvolumes
     let result = create_all_subvolumes(cfg, mount_point, dry_run);
 
-    // Save config to @etc subvolume (before unmount!)
+    // Save config to @etc subvolume (before umount!)
     if !dry_run && result.is_ok() {
         let subvol_config_dir = format!("{}/@etc/wslarc", mount_point);
         if Path::new(&format!("{}/@etc", mount_point)).exists() {
@@ -333,7 +333,7 @@ fn create_subvolumes(cfg: &Config, device: &str, dry_run: bool) -> Result<()> {
         }
     }
 
-    // Unmount
+    // Umount
     if !dry_run {
         shell_run("umount", &[mount_point])?;
         fs::remove_dir(mount_point)?;

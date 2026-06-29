@@ -94,7 +94,7 @@ sudo wslarc mount --dry-run
 
 ```bash
 # Disable wslarc-managed mounts and timer
-sudo wslarc unmount
+sudo wslarc umount
 ```
 
 ### Status, snapshots, and restore

@@ -7,7 +7,7 @@ use crate::utils::prompt::{confirm_or_yes, info, step, success};
 use crate::utils::shell::run_or_dry;
 
 pub fn run(config: &Config, yes: bool, dry_run: bool) -> Result<()> {
-    println!("{}", style("WSL Btrfs Unmount").bold().cyan());
+    println!("{}", style("WSL Btrfs Umount").bold().cyan());
 
     println!();
     println!(
@@ -35,7 +35,7 @@ pub fn run(config: &Config, yes: bool, dry_run: bool) -> Result<()> {
 
     // Done
     println!();
-    println!("{}", style("Unmount setup complete!").green().bold());
+    println!("{}", style("Umount setup complete!").green().bold());
     println!();
     println!("Restart WSL to apply: {}", style("wsl --shutdown").cyan());
     println!();

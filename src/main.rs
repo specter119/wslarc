@@ -45,7 +45,7 @@ enum Commands {
     },
 
     /// Disable systemd mount units
-    Unmount {
+    Umount {
         /// Only show what would be done
         #[arg(long)]
         dry_run: bool,
@@ -113,8 +113,8 @@ fn main() -> Result<()> {
         Commands::Mount { dry_run } => {
             commands::mount::run(&cfg, cli.yes, dry_run)?;
         }
-        Commands::Unmount { dry_run } => {
-            commands::unmount::run(&cfg, cli.yes, dry_run)?;
+        Commands::Umount { dry_run } => {
+            commands::umount::run(&cfg, cli.yes, dry_run)?;
         }
         Commands::Status => {
             commands::status::run(&cfg)?;

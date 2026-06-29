@@ -5,4 +5,4 @@ pub mod mount;
 pub mod restore;
 pub mod snapshot;
 pub mod status;
-pub mod unmount;
+pub mod umount;
