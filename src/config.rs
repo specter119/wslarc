@@ -9,6 +9,7 @@ pub struct Config {
     pub vhdx: VhdxConfig,
     pub user: UserConfig,
     pub mount: MountConfig,
+    #[serde(default)]
     pub subvolumes: SubvolumesConfig,
     pub btrbk: BtrbkConfig,
     /// Ext4 root sync config (for systemd version sync)
@@ -18,6 +19,193 @@ pub struct Config {
     /// UUID of the Btrfs filesystem (set after formatting)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Distribution {
+    Arch,
+    Debian,
+}
+
+impl Distribution {
+    pub fn detect() -> Self {
+        let os_release = fs::read_to_string("/etc/os-release").unwrap_or_default();
+        let id = os_release
+            .lines()
+            .find_map(|line| line.strip_prefix("ID="))
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_ascii_lowercase();
+
+        match id.as_str() {
+            "debian" | "ubuntu" | "linuxmint" | "kali" => Self::Debian,
+            _ => Self::Arch,
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Distribution::Arch => "Arch",
+            Distribution::Debian => "Debian",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubvolumesConfig {
+    /// A-class backup targets (subvol_name -> config)
+    #[serde(default = "default_backup")]
+    pub backup: HashMap<String, BackupSubvol>,
+    /// B-class excluded paths (nested subvolumes)
+    #[serde(default = "default_user_exclude")]
+    pub exclude: ExcludeConfig,
+    /// C-class transfer subvolumes (high I/O, nodatacow)
+    #[serde(default = "default_transfer")]
+    pub transfer: HashMap<String, TransferSubvol>,
+    /// Snapshot-only subvolumes, not mounted directly
+    #[serde(default = "default_snapshot_only")]
+    pub snapshot_only: HashMap<String, SnapshotSubvol>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotSubvol {
+    pub snapshot_name: String,
+    #[serde(default = "default_etc_source")]
+    pub source: String,
+}
+
+fn default_user_backup() -> HashMap<String, BackupSubvol> {
+    let mut backup = HashMap::new();
+    backup.insert(
+        "@home".to_string(),
+        BackupSubvol::Simple("/home/$USER".to_string()),
+    );
+    backup
+}
+
+fn default_user_exclude() -> ExcludeConfig {
+    ExcludeConfig {
+        parent: "@home".to_string(),
+        paths: vec![
+            ".cache".to_string(),
+            ".local".to_string(),
+            ".npm".to_string(),
+            ".bun".to_string(),
+            ".vscode-server-insiders".to_string(),
+        ],
+    }
+}
+
+fn default_common_backup() -> HashMap<String, BackupSubvol> {
+    let mut backup = HashMap::new();
+    backup.insert("@usr".to_string(), BackupSubvol::Simple("/usr".to_string()));
+    backup.insert("@opt".to_string(), BackupSubvol::Simple("/opt".to_string()));
+    backup
+}
+
+fn default_distribution_backup(distribution: Distribution) -> HashMap<String, BackupSubvol> {
+    let mut backup = default_common_backup();
+    match distribution {
+        Distribution::Arch => {
+            backup.insert(
+                "@var_lib_pacman".to_string(),
+                BackupSubvol::Simple("/var/lib/pacman".to_string()),
+            );
+        }
+        Distribution::Debian => {
+            backup.insert(
+                "@var_lib_dpkg".to_string(),
+                BackupSubvol::Simple("/var/lib/dpkg".to_string()),
+            );
+            backup.insert(
+                "@var_lib_apt".to_string(),
+                BackupSubvol::Simple("/var/lib/apt".to_string()),
+            );
+        }
+    }
+
+    backup
+}
+
+fn default_backup_for(distribution: Distribution) -> HashMap<String, BackupSubvol> {
+    let mut backup = default_user_backup();
+    backup.extend(default_distribution_backup(distribution));
+    backup
+}
+
+fn default_backup() -> HashMap<String, BackupSubvol> {
+    default_backup_for(Distribution::detect())
+}
+
+fn default_transfer() -> HashMap<String, TransferSubvol> {
+    let mut transfer = HashMap::new();
+    transfer.insert(
+        "@var_cache".to_string(),
+        TransferSubvol {
+            mount: "/var/cache".to_string(),
+            nodatacow: true,
+            options: None,
+        },
+    );
+    transfer.insert(
+        "@var_log".to_string(),
+        TransferSubvol {
+            mount: "/var/log".to_string(),
+            nodatacow: false,
+            options: None,
+        },
+    );
+    transfer.insert(
+        "@var_tmp".to_string(),
+        TransferSubvol {
+            mount: "/var/tmp".to_string(),
+            nodatacow: true,
+            options: None,
+        },
+    );
+    transfer.insert(
+        "@containers".to_string(),
+        TransferSubvol {
+            mount: "/var/lib/containers".to_string(),
+            nodatacow: true,
+            options: None,
+        },
+    );
+    transfer
+}
+
+fn default_snapshot_only() -> HashMap<String, SnapshotSubvol> {
+    let mut snapshot_only = HashMap::new();
+    snapshot_only.insert(
+        "@etc".to_string(),
+        SnapshotSubvol {
+            snapshot_name: "etc".to_string(),
+            source: default_etc_source(),
+        },
+    );
+    snapshot_only
+}
+
+fn default_etc_source() -> String {
+    "/etc".to_string()
+}
+
+impl SubvolumesConfig {
+    /// Build the initial editable subvolume template for a distribution.
+    pub fn for_distribution(distribution: Distribution) -> Self {
+        Self {
+            backup: default_backup_for(distribution),
+            exclude: default_user_exclude(),
+            transfer: default_transfer(),
+            snapshot_only: default_snapshot_only(),
+        }
+    }
+}
+
+impl Default for SubvolumesConfig {
+    fn default() -> Self {
+        Self::for_distribution(Distribution::detect())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,16 +258,6 @@ pub struct MountConfig {
 
 fn default_base_options() -> String {
     "compress=zstd:3,noatime,nofail".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubvolumesConfig {
-    /// A-class: backup targets (subvol_name -> config)
-    pub backup: HashMap<String, BackupSubvol>,
-    /// B-class: excluded paths (nested subvolumes)
-    pub exclude: ExcludeConfig,
-    /// C-class: transfer subvolumes (high I/O, nodatacow)
-    pub transfer: HashMap<String, TransferSubvol>,
 }
 
 /// A-class backup subvolume config
@@ -160,23 +338,59 @@ impl Default for BtrbkConfig {
 }
 
 impl Config {
-    /// Load config from file, or return default if file doesn't exist
-    pub fn load_or_default(path: &str) -> Result<Self> {
+    /// Load an existing config, or build an initial template if it is missing.
+    #[cfg(test)]
+    pub fn load_or_default(path: &str, distribution: Distribution) -> Result<Self> {
         if Path::new(path).exists() {
             Self::load(path)
         } else {
-            Ok(Self::default())
+            Ok(Self::for_distribution(distribution))
+        }
+    }
+
+    /// Load an existing config without resolving path templates.
+    ///
+    /// Initialization needs to collect the target user before resolving
+    /// `$USER`. Other commands should continue using [`Self::load`]
+    /// so they receive paths ready for runtime use.
+    pub fn load_or_default_unexpanded(path: &str, distribution: Distribution) -> Result<Self> {
+        if Path::new(path).exists() {
+            Self::load_unexpanded(path)
+        } else {
+            Ok(Self::for_distribution(distribution))
         }
     }
 
     /// Load config from file
     pub fn load(path: &str) -> Result<Self> {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {}", path))?;
-        let mut config: Config = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path))?;
+        let mut config = Self::load_unexpanded(path)?;
         config.expand_variables();
         Ok(config)
+    }
+
+    /// Load config from file without resolving path templates.
+    pub fn load_unexpanded(path: &str) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path))?;
+        toml::from_str(&content).with_context(|| format!("Failed to parse config file: {}", path))
+    }
+
+    /// Return a runtime copy with path templates resolved for this config's user.
+    ///
+    /// The original config is not changed, so initialization can save the
+    /// original `$USER` template instead of persisting a user-specific rewrite.
+    pub fn resolve_variables(&self) -> Self {
+        let mut config = self.clone();
+        config.expand_variables();
+        config
+    }
+
+    /// Set the target user without rewriting configured path templates.
+    ///
+    /// This is intended for initialization's interactive flow. Literal paths
+    /// remain literal and `$USER` is resolved later on a runtime copy.
+    pub fn set_user_unexpanded(&mut self, user: &str) {
+        self.user.name = user.to_string();
     }
 
     /// Save config to file
@@ -195,7 +409,6 @@ impl Config {
     fn expand_variables(&mut self) {
         let user = self.get_user();
 
-        // Expand in backup subvolumes
         for backup in self.subvolumes.backup.values_mut() {
             match backup {
                 BackupSubvol::Simple(m) => *m = m.replace("$USER", &user),
@@ -203,9 +416,12 @@ impl Config {
             }
         }
 
-        // Expand in transfer subvolumes
         for subvol in self.subvolumes.transfer.values_mut() {
             subvol.mount = subvol.mount.replace("$USER", &user);
+        }
+
+        for snapshot in self.subvolumes.snapshot_only.values_mut() {
+            snapshot.source = snapshot.source.replace("$USER", &user);
         }
     }
 
@@ -215,67 +431,19 @@ impl Config {
     }
 
     /// Set user and expand variables in paths
+    #[cfg(test)]
     pub fn set_user(&mut self, user: &str) {
         self.user.name = user.to_string();
         self.expand_variables();
     }
-}
 
-impl Default for Config {
-    fn default() -> Self {
-        let mut backup = HashMap::new();
-        // Note: @etc is snapshot-only (not mounted to /etc) to avoid systemd unit duplication
-        backup.insert("@usr".to_string(), BackupSubvol::Simple("/usr".to_string()));
-        backup.insert("@opt".to_string(), BackupSubvol::Simple("/opt".to_string()));
-        backup.insert(
-            "@home".to_string(),
-            BackupSubvol::Simple("/home/$USER".to_string()),
-        );
-        // @var_lib_pacman must be snapshotted together with @usr for consistency
-        backup.insert(
-            "@var_lib_pacman".to_string(),
-            BackupSubvol::Simple("/var/lib/pacman".to_string()),
-        );
-
-        let mut transfer = HashMap::new();
-        transfer.insert(
-            "@containers".to_string(),
-            TransferSubvol {
-                mount: "/var/lib/containers".to_string(),
-                nodatacow: true,
-                options: None,
-            },
-        );
-        transfer.insert(
-            "@var_cache".to_string(),
-            TransferSubvol {
-                mount: "/var/cache".to_string(),
-                nodatacow: true,
-                options: None,
-            },
-        );
-        transfer.insert(
-            "@var_log".to_string(),
-            TransferSubvol {
-                mount: "/var/log".to_string(),
-                nodatacow: false,
-                options: None,
-            },
-        );
-        transfer.insert(
-            "@var_tmp".to_string(),
-            TransferSubvol {
-                mount: "/var/tmp".to_string(),
-                nodatacow: true,
-                options: None,
-            },
-        );
-
+    /// Build a new configuration with the selected distribution's template.
+    pub fn for_distribution(distribution: Distribution) -> Self {
         Self {
             vhdx: VhdxConfig {
                 // Must be provided by user
                 path: String::new(),
-                label: "ArchBtrfs".to_string(),
+                label: format!("{}Btrfs", distribution.display_name()),
             },
             user: UserConfig {
                 name: String::new(),
@@ -285,24 +453,17 @@ impl Default for Config {
                 base: "/mnt/btrfs".to_string(),
                 options: default_base_options(),
             },
-            subvolumes: SubvolumesConfig {
-                backup,
-                exclude: ExcludeConfig {
-                    parent: "@home".to_string(),
-                    paths: vec![
-                        ".cache".to_string(),
-                        ".local".to_string(),
-                        ".npm".to_string(),
-                        ".bun".to_string(),
-                        ".vscode-server-insiders".to_string(),
-                    ],
-                },
-                transfer,
-            },
+            subvolumes: SubvolumesConfig::for_distribution(distribution),
             btrbk: BtrbkConfig::default(),
             ext4_sync: Ext4SyncConfig::default(),
             uuid: None,
         }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::for_distribution(Distribution::detect())
     }
 }
 
@@ -317,7 +478,10 @@ mod tests {
         let cfg = Config::default();
 
         assert!(cfg.vhdx.path.is_empty());
-        assert_eq!(cfg.vhdx.label, "ArchBtrfs");
+        assert_eq!(
+            cfg.vhdx.label,
+            format!("{}Btrfs", Distribution::detect().display_name())
+        );
         assert_eq!(cfg.mount.base, "/mnt/btrfs");
         assert!(cfg.mount.options.contains("compress=zstd:3"));
         assert_eq!(cfg.btrbk.preserve_min, "latest");
@@ -353,6 +517,57 @@ mod tests {
             assert!(backup.mount().contains("alice"));
             assert!(!backup.mount().contains("$USER"));
         }
+    }
+
+    #[test]
+    fn test_unexpanded_load_preserves_user_template() {
+        let mut cfg = Config::for_distribution(Distribution::Arch);
+        cfg.user.name = "old-user".to_string();
+        cfg.subvolumes.backup.insert(
+            "@home".to_string(),
+            BackupSubvol::Simple("/home/$USER".to_string()),
+        );
+
+        let file = NamedTempFile::new().unwrap();
+        cfg.save(file.path().to_str().unwrap()).unwrap();
+
+        let raw = Config::load_unexpanded(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(raw.user.name, "old-user");
+        assert_eq!(
+            raw.subvolumes.backup.get("@home").unwrap().mount(),
+            "/home/$USER"
+        );
+
+        let runtime = raw.resolve_variables();
+        assert_eq!(
+            runtime.subvolumes.backup.get("@home").unwrap().mount(),
+            "/home/old-user"
+        );
+    }
+
+    #[test]
+    fn test_set_user_unexpanded_keeps_literal_paths() {
+        let mut cfg = Config::for_distribution(Distribution::Arch);
+        cfg.subvolumes.backup.insert(
+            "@literal".to_string(),
+            BackupSubvol::Simple("/home/old-user/data".to_string()),
+        );
+        cfg.subvolumes.backup.insert(
+            "@template".to_string(),
+            BackupSubvol::Simple("/home/$USER/data".to_string()),
+        );
+
+        cfg.set_user_unexpanded("new-user");
+        let runtime = cfg.resolve_variables();
+
+        assert_eq!(
+            runtime.subvolumes.backup.get("@literal").unwrap().mount(),
+            "/home/old-user/data"
+        );
+        assert_eq!(
+            runtime.subvolumes.backup.get("@template").unwrap().mount(),
+            "/home/new-user/data"
+        );
     }
 
     #[test]
@@ -392,12 +607,26 @@ timer_schedule = "*-*-* 02:00:00"
         assert_eq!(cfg.vhdx.label, "TestLabel");
         assert_eq!(cfg.mount.base, "/mnt/test");
         assert_eq!(cfg.btrbk.preserve_min, "1d");
+        assert!(cfg.subvolumes.backup.contains_key("@home"));
     }
 
     #[test]
     fn test_load_or_default_missing_file() {
-        let cfg = Config::load_or_default("/nonexistent/path/config.toml").unwrap();
+        let cfg =
+            Config::load_or_default("/nonexistent/path/config.toml", Distribution::Arch).unwrap();
         assert!(cfg.vhdx.path.is_empty());
+        assert!(cfg.subvolumes.backup.contains_key("@var_lib_pacman"));
+    }
+
+    #[test]
+    fn test_load_or_default_unexpanded_keeps_default_user_template() {
+        let cfg =
+            Config::load_or_default_unexpanded("/nonexistent/path/config.toml", Distribution::Arch)
+                .unwrap();
+        assert_eq!(
+            cfg.subvolumes.backup.get("@home").unwrap().mount(),
+            "/home/$USER"
+        );
     }
 
     #[test]
@@ -412,9 +641,11 @@ timer_schedule = "*-*-* 02:00:00"
 
         cfg.save(path).unwrap();
         let loaded = Config::load(path).unwrap();
+        let saved = fs::read_to_string(path).unwrap();
 
         assert_eq!(loaded.vhdx.path, cfg.vhdx.path);
         assert_eq!(loaded.uuid, cfg.uuid);
+        assert!(!saved.contains("distribution"));
     }
 
     #[test]

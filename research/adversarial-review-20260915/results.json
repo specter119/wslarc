@@ -1,0 +1,102 @@
+{
+  "source_sha256": "a00c0f7132a220de0e6f4ecb5d5c7313cf73a61cfe1b81a02625984e791aa90b",
+  "baseline_passed": true,
+  "cases": [
+    {
+      "case": "binary-source-deleted-before-copy",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "utils::storage::tests::binary_install_preserves_aliased_source_for_all_copies"
+    },
+    {
+      "case": "binary-destination-deleted-before-staging",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "utils::storage::tests::binary_copy_failure_keeps_old_destination"
+    },
+    {
+      "case": "preview-persists-configuration",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "commands::snapshot::tests::prune_preview_uses_current_config_without_changing_installed_file"
+    },
+    {
+      "case": "timer-discards-custom-configuration",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "generators::btrbk::tests::test_generate_service"
+    },
+    {
+      "case": "status-omits-managed-ext4-unit",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "commands::status::tests::status_includes_ext4_unit_only_when_managed"
+    },
+    {
+      "case": "arch-archive-assumes-host-architecture",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "commands::hook_sync_systemd::tests::archive_mapping_uses_real_name_version_and_architecture"
+    },
+    {
+      "case": "apt-clears-pending-before-sync",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "commands::hook_sync_systemd::tests::apt_upgrade_failure_retains_pending_and_previous_state"
+    },
+    {
+      "case": "debian-rejects-held-installed-packages",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "utils::cli::tests::parse_debian_status_version_only_accepts_installed_packages"
+    },
+    {
+      "case": "dependency-closure-retains-removed-roots",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "generators::ext4_sync::tests::test_collect_recursive_targets_returns_empty_when_all_roots_removed"
+    },
+    {
+      "case": "init-forgets-parent-before-nested-creation",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "commands::init::tests::initialization_seeds_nested_home_and_transfer_sources"
+    },
+    {
+      "case": "init-omits-transfer-seeding",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "commands::init::tests::initialization_seeds_nested_home_and_transfer_sources"
+    },
+    {
+      "case": "init-accepts-an-ordinary-directory-as-subvolume",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "commands::init::tests::ordinary_existing_path_is_not_silently_accepted_as_subvolume"
+    },
+    {
+      "case": "init-preview-writes-seed-progress",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "commands::init::tests::init_dry_run_does_not_create_progress_for_existing_empty_targets"
+    },
+    {
+      "case": "restore-unmounts-before-staging",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "commands::restore::tests::stage_failure_happens_before_unmount_or_cutover"
+    },
+    {
+      "case": "restore-omits-cutover-rollback",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "commands::restore::tests::remount_failure_rolls_back_parent_and_nested_child"
+    },
+    {
+      "case": "restore-omits-nested-subvolume-moves",
+      "mutant_rejected": true,
+      "restored_passed": true,
+      "test": "commands::restore::tests::nested_children_move_into_new_parent_and_prior_backup_survives"
+    }
+  ]
+}

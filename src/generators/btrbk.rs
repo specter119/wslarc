@@ -31,7 +31,7 @@ pub fn generate_config(config: &Config) -> String {
     lines.push(String::new());
 
     // A-class subvolumes (backup targets)
-    lines.push("  # A-class: Backup targets".to_string());
+    lines.push("  # Configured A-class backup targets".to_string());
     for subvol in config.subvolumes.backup.keys() {
         let name = subvol.trim_start_matches('@');
         lines.push(format!("  subvolume {}", subvol));
@@ -39,11 +39,13 @@ pub fn generate_config(config: &Config) -> String {
         lines.push(String::new());
     }
 
-    // @etc: snapshot-only (not mounted, but still snapshotted)
-    lines.push("  # @etc: snapshot-only (not mounted to /etc)".to_string());
-    lines.push("  subvolume @etc".to_string());
-    lines.push("    snapshot_name etc".to_string());
-    lines.push(String::new());
+    // Snapshot-only subvolumes (not mounted directly)
+    lines.push("  # Configured snapshot-only subvolumes".to_string());
+    for (subvol, snapshot) in &config.subvolumes.snapshot_only {
+        lines.push(format!("  subvolume {}", subvol));
+        lines.push(format!("    snapshot_name {}", snapshot.snapshot_name));
+        lines.push(String::new());
+    }
 
     // Note about excluded subvolumes
     lines.push("# B-class nested subvolumes are automatically excluded".to_string());
@@ -53,8 +55,9 @@ pub fn generate_config(config: &Config) -> String {
 }
 
 /// Generate btrbk.service content
-pub fn generate_service(config: &Config) -> String {
+pub fn generate_service(config: &Config, config_path: &str) -> String {
     let base_mount_unit = format!("{}.mount", path_to_unit_name(&config.mount.base));
+    let config_arg = crate::generators::invocation::systemd_argument(config_path);
 
     format!(
         r#"[Unit]
@@ -64,7 +67,7 @@ After={base_mount_unit}
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/btrbk -q run
+ExecStart=/usr/local/bin/wslarc --config {config_arg} snapshot run
 Nice=19
 IOSchedulingClass=idle
 "#
@@ -93,7 +96,7 @@ WantedBy=timers.target
 mod tests {
     use super::*;
     use crate::config::{
-        BackupSubvol, BtrbkConfig, Config, ExcludeConfig, Ext4SyncConfig, MountConfig,
+        BackupSubvol, BtrbkConfig, Config, Distribution, Ext4SyncConfig, MountConfig,
         SubvolumesConfig, UserConfig, VhdxConfig,
     };
     use std::collections::HashMap;
@@ -105,6 +108,14 @@ mod tests {
             BackupSubvol::Simple("/home/testuser".to_string()),
         );
         backup.insert("@usr".to_string(), BackupSubvol::Simple("/usr".to_string()));
+
+        let mut subvolumes = SubvolumesConfig::for_distribution(Distribution::Arch);
+        subvolumes.backup = backup;
+        subvolumes.exclude = crate::config::ExcludeConfig {
+            parent: "@home".to_string(),
+            paths: vec![".cache".to_string()],
+        };
+        subvolumes.transfer = HashMap::new();
 
         Config {
             vhdx: VhdxConfig {
@@ -119,14 +130,7 @@ mod tests {
                 base: "/mnt/btrfs".to_string(),
                 options: "compress=zstd:3,noatime,nofail".to_string(),
             },
-            subvolumes: SubvolumesConfig {
-                backup,
-                exclude: ExcludeConfig {
-                    parent: "@home".to_string(),
-                    paths: vec![".cache".to_string()],
-                },
-                transfer: HashMap::new(),
-            },
+            subvolumes,
             btrbk: BtrbkConfig::default(),
             ext4_sync: Ext4SyncConfig::default(),
             uuid: Some("12345678-1234-1234-1234-123456789abc".to_string()),
@@ -157,11 +161,13 @@ mod tests {
     #[test]
     fn test_generate_service() {
         let cfg = test_config();
-        let output = generate_service(&cfg);
+        let output = generate_service(&cfg, "/etc/custom config.toml");
 
         assert!(output.contains("[Unit]"));
         assert!(output.contains("[Service]"));
-        assert!(output.contains("ExecStart=/usr/bin/btrbk -q run"));
+        assert!(output.contains(
+            "ExecStart=/usr/local/bin/wslarc --config \"/etc/custom config.toml\" snapshot run"
+        ));
         assert!(output.contains(".mount"));
     }
 

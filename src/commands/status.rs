@@ -1,13 +1,14 @@
 use anyhow::Result;
 use console::style;
 
-use crate::config::Config;
-use crate::generators::systemd;
+use crate::config::{Config, Distribution};
+use crate::generators::{ext4_sync, systemd};
 use crate::utils::cli::{find_mount, list_btrfs_mounts, list_directory_names, systemctl_property};
 use crate::utils::prompt::{kv, section};
 use crate::utils::shell::run as shell_run;
+use crate::utils::storage::verify_mount;
 
-pub fn run(config: &Config) -> Result<()> {
+pub fn run(config: &Config, distribution: Distribution) -> Result<()> {
     println!("{}", style("WSL Btrfs Status").bold().cyan());
 
     // Configuration
@@ -16,6 +17,7 @@ pub fn run(config: &Config) -> Result<()> {
     kv("VHDX", &config.vhdx.path);
     kv("Mount base", &config.mount.base);
     kv("User", &config.get_user());
+    kv("Distribution", distribution.display_name());
 
     // Btrfs mounts
     section("Btrfs Mounts");
@@ -30,7 +32,7 @@ pub fn run(config: &Config) -> Result<()> {
 
     // Subvolumes (if mounted)
     section("Subvolumes");
-    if !is_mounted(&config.mount.base) {
+    if !is_configured_volume_mounted(config) {
         println!("  {} not mounted", config.mount.base);
     } else {
         let subvols = shell_run("btrfs", &["subvolume", "list", &config.mount.base]);
@@ -54,7 +56,11 @@ pub fn run(config: &Config) -> Result<()> {
     // Snapshots
     section("Snapshots");
     let snapshot_dir = format!("{}/{}", config.mount.base, config.btrbk.snapshot_dir);
-    match list_directory_names(&snapshot_dir) {
+    match if is_configured_volume_mounted(config) {
+        list_directory_names(&snapshot_dir)
+    } else {
+        Err(anyhow::anyhow!("Btrfs base is not mounted"))
+    } {
         Ok(entries) if !entries.is_empty() => {
             let count = entries.len();
             println!("  Total: {} snapshots", count);
@@ -140,10 +146,12 @@ fn check_service(name: &str) {
     );
 }
 
-fn is_mounted(path: &str) -> bool {
-    find_mount(path)
-        .map(|mount| mount.is_some())
-        .unwrap_or(false)
+fn is_configured_volume_mounted(config: &Config) -> bool {
+    let Some(uuid) = config.uuid.as_deref() else {
+        return false;
+    };
+    find_mount(&config.mount.base)
+        .is_ok_and(|mount| verify_mount(mount.as_ref(), &config.mount.base, "btrfs", uuid).is_ok())
 }
 
 fn configured_subvolume_lines(config: &Config) -> Vec<String> {
@@ -166,7 +174,9 @@ fn configured_subvolume_lines(config: &Config) -> Vec<String> {
         ));
     }
 
-    lines.push("@etc [snapshot-only]".to_string());
+    for name in config.subvolumes.snapshot_only.keys() {
+        lines.push(format!("{} [snapshot-only]", name));
+    }
     lines.sort();
     lines
 }
@@ -181,6 +191,16 @@ fn mount_unit_names(config: &Config) -> Vec<String> {
     for transfer in config.subvolumes.transfer.values() {
         units.push(systemd::mount_unit_filename(&transfer.mount));
     }
+    if config
+        .subvolumes
+        .backup
+        .values()
+        .any(|backup| backup.mount() == "/usr")
+    {
+        units.push(ext4_sync::ext4_mount_unit_filename(config));
+    }
+    units.sort();
+    units.dedup();
 
     units
 }
@@ -256,6 +276,15 @@ fn summarize_error(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_includes_ext4_unit_only_when_managed() {
+        let mut config = Config::for_distribution(Distribution::Arch);
+        let ext4 = ext4_sync::ext4_mount_unit_filename(&config);
+        assert!(mount_unit_names(&config).contains(&ext4));
+        config.subvolumes.backup.remove("@usr");
+        assert!(!mount_unit_names(&config).contains(&ext4));
+    }
 
     #[test]
     fn summarize_error_prefers_specific_failure_line() {

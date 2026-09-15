@@ -95,7 +95,7 @@ pub fn mount_unit_filename(mount_point: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{
-        BackupSubvol, BtrbkConfig, Config, Distribution, Ext4SyncConfig, MountConfig,
+        BackupSubvol, BtrbkConfig, Config, ExcludeConfig, Ext4SyncConfig, MountConfig,
         SubvolumesConfig, TransferSubvol, UserConfig, VhdxConfig,
     };
     use std::collections::HashMap;
@@ -118,14 +118,6 @@ mod tests {
             },
         );
 
-        let mut subvolumes = SubvolumesConfig::for_distribution(Distribution::Arch);
-        subvolumes.backup = backup;
-        subvolumes.exclude = crate::config::ExcludeConfig {
-            parent: "@home".to_string(),
-            paths: vec![".cache".to_string()],
-        };
-        subvolumes.transfer = transfer;
-
         Config {
             vhdx: VhdxConfig {
                 path: r"C:\Users\test\.local\share\wsl\btrfs.vhdx".to_string(),
@@ -139,7 +131,14 @@ mod tests {
                 base: "/mnt/btrfs".to_string(),
                 options: "compress=zstd:3,noatime,nofail".to_string(),
             },
-            subvolumes,
+            subvolumes: SubvolumesConfig {
+                backup,
+                exclude: ExcludeConfig {
+                    parent: "@home".to_string(),
+                    paths: vec![".cache".to_string()],
+                },
+                transfer,
+            },
             btrbk: BtrbkConfig::default(),
             ext4_sync: Ext4SyncConfig::default(),
             uuid: Some("12345678-1234-1234-1234-123456789abc".to_string()),

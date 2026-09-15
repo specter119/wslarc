@@ -2,6 +2,7 @@ use anyhow::Result;
 use console::style;
 
 use crate::config::Config;
+use crate::generators::ext4_sync;
 use crate::generators::systemd;
 use crate::utils::prompt::{confirm_or_yes, info, step, success};
 use crate::utils::shell::run_or_dry;
@@ -66,6 +67,18 @@ fn disable_mount_units(config: &Config, dry_run: bool) -> Result<()> {
         let unit = systemd::mount_unit_filename(&transfer.mount);
         run_or_dry("systemctl", &["disable", &unit], dry_run)?;
         info(&format!("{} disabled", unit));
+    }
+
+    // Disable the ext4 root mount.
+    if config
+        .subvolumes
+        .backup
+        .values()
+        .any(|backup| backup.mount() == "/usr")
+    {
+        let ext4_unit = ext4_sync::ext4_mount_unit_filename(config);
+        run_or_dry("systemctl", &["disable", &ext4_unit], dry_run)?;
+        info(&format!("{} disabled", ext4_unit));
     }
 
     success("All mount units disabled");

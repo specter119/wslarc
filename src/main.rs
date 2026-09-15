@@ -7,6 +7,9 @@ mod config;
 mod generators;
 mod utils;
 
+#[cfg(test)]
+mod ablation;
+
 #[derive(Parser)]
 #[command(name = "wslarc")]
 #[command(about = "WSL2 Btrfs backup and restore tool", long_about = None)]
@@ -67,10 +70,14 @@ enum Commands {
         snapshot: Option<String>,
     },
 
-    /// Sync systemd packages to ext4 root (called by pacman hook)
+    /// Sync systemd packages to ext4 root (called by the distribution package hook)
     HookSyncSystemd {
         #[arg(long)]
         dry_run: bool,
+        #[arg(long, hide = true)]
+        apt_pre: bool,
+        #[arg(long, hide = true)]
+        apt_post: bool,
     },
 
     /// Attach Btrfs VHDX if not already mounted (called by wsl.conf at boot)
@@ -83,6 +90,12 @@ enum SnapshotAction {
     Run,
     /// List available snapshots
     List,
+    /// Preview or remove snapshots outside the retention policy
+    Prune {
+        /// Only show what would be removed
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -102,32 +115,63 @@ fn main() -> Result<()> {
 
     debug!("Log level: {:?}", log_level);
 
+    let distribution = config::Distribution::detect();
     let config_path = cli.config.as_deref().unwrap_or("/etc/wslarc/config.toml");
     debug!("Loading config from: {}", config_path);
-    let cfg = config::Config::load_or_default(config_path)?;
+    let cfg = if matches!(&cli.command, Commands::Init { .. }) {
+        config::Config::load_or_default_unexpanded(config_path, distribution)?
+    } else {
+        // A missing runtime config must not silently select a fresh template.
+        config::Config::load(config_path)?
+    };
 
     match cli.command {
         Commands::Init { dry_run } => {
-            commands::init::run(&cfg, cli.yes, dry_run)?;
+            commands::init::run(&cfg, distribution, config_path, cli.yes, dry_run)?;
         }
         Commands::Mount { dry_run } => {
-            commands::mount::run(&cfg, cli.yes, dry_run)?;
+            let absolute_config = std::fs::canonicalize(config_path)?;
+            let absolute_config = absolute_config
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Configuration path must be UTF-8"))?;
+            commands::mount::run(&cfg, distribution, absolute_config, cli.yes, dry_run)?;
         }
         Commands::Umount { dry_run } => {
             commands::umount::run(&cfg, cli.yes, dry_run)?;
         }
         Commands::Status => {
-            commands::status::run(&cfg)?;
+            commands::status::run(&cfg, distribution)?;
         }
         Commands::Snapshot { action } => match action {
-            SnapshotAction::Run => commands::snapshot::run(&cfg)?,
-            SnapshotAction::List => commands::snapshot::list(&cfg)?,
+            SnapshotAction::Run => commands::snapshot::run(&cfg, distribution)?,
+            SnapshotAction::List => commands::snapshot::list(&cfg, distribution)?,
+            SnapshotAction::Prune { dry_run } => {
+                commands::snapshot::prune(&cfg, distribution, cli.yes, dry_run)?
+            }
         },
         Commands::Restore { snapshot } => {
-            commands::restore::run(&cfg, snapshot, cli.yes)?;
+            commands::restore::run(&cfg, distribution, snapshot, cli.yes)?;
         }
-        Commands::HookSyncSystemd { dry_run } => {
-            commands::hook_sync_systemd::run(&cfg, dry_run)?;
+        Commands::HookSyncSystemd {
+            dry_run,
+            apt_pre,
+            apt_post,
+        } => {
+            if apt_pre {
+                if dry_run {
+                    println!("[dry-run] Would record APT package targets");
+                } else if let Err(error) = commands::hook_sync_systemd::run_apt_pre() {
+                    eprintln!("warning: APT pre-sync hook failed: {error:#}");
+                }
+            } else if apt_post {
+                if let Err(error) =
+                    commands::hook_sync_systemd::run_apt_post(&cfg, distribution, dry_run)
+                {
+                    eprintln!("warning: APT ext4 synchronization failed: {error:#}");
+                }
+            } else {
+                commands::hook_sync_systemd::run(&cfg, distribution, dry_run)?;
+            }
         }
         Commands::Attach => {
             commands::attach::run(&cfg)?;

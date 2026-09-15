@@ -1,37 +1,69 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use console::style;
 use ini::Ini;
 use std::fs;
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
-use crate::config::Config;
-use crate::generators::{btrbk, ext4_sync, systemd};
-use crate::utils::cli::{ensure_dependencies, Dependency};
+use crate::config::{Config, Distribution};
+use crate::generators::{btrbk, ext4_sync, invocation, systemd};
+use crate::utils::cli::{ensure_dependencies_for, find_mount, Dependency, MountInfo};
 use crate::utils::prompt::{confirm_or_yes, info, step, success, warn};
 use crate::utils::shell::run_or_dry;
+use crate::utils::storage::{install_copies, verify_mount};
 
 const SYSTEMD_DIR: &str = "/etc/systemd/system";
 const BTRBK_CONF: &str = "/etc/btrbk/btrbk.conf";
 const WSLARC_BIN: &str = "/usr/local/bin/wslarc";
 const WSL_CONF: &str = "/etc/wsl.conf";
-const PACMAN_HOOK_PATH: &str = "/etc/pacman.d/hooks/sync-systemd-ext4.hook";
 
 fn has_usr_subvol(config: &Config) -> bool {
-    config.subvolumes.backup.contains_key("@usr")
+    usr_subvol_name(config).is_some()
 }
 
-pub fn run(config: &Config, yes: bool, dry_run: bool) -> Result<()> {
+fn usr_subvol_name(config: &Config) -> Option<&str> {
+    config
+        .subvolumes
+        .backup
+        .iter()
+        .find(|(_, backup)| backup.mount() == "/usr")
+        .map(|(subvol, _)| subvol.as_str())
+}
+
+pub fn run(
+    config: &Config,
+    distribution: Distribution,
+    config_path: &str,
+    yes: bool,
+    dry_run: bool,
+) -> Result<()> {
     println!("{}", style("WSL Btrfs Mount Setup").bold().cyan());
 
     if config.uuid.is_none() {
         bail!("UUID not set. Run 'wslarc init' first.");
     }
-
-    ensure_dependencies(&[Dependency::new("btrbk", &["btrbk"])])?;
+    validate_automation_config_path(config, Path::new(config_path))?;
+    if fs::metadata(config_path)?.dev() != fs::metadata("/")?.dev() {
+        bail!("Automation configuration must reside on the ext4 root filesystem");
+    }
 
     let needs_ext4_sync = has_usr_subvol(config);
+    let mut dependencies = vec![Dependency::new("btrbk", &["btrbk"])];
+    if needs_ext4_sync {
+        dependencies.push(Dependency::new("btrfs-progs", &["btrfs"]));
+        dependencies.push(Dependency::new("rsync", &["rsync"]));
+        match distribution {
+            crate::config::Distribution::Arch => {
+                dependencies.push(Dependency::new("pacman", &["pacman"]))
+            }
+            crate::config::Distribution::Debian => {
+                dependencies.push(Dependency::new("dpkg", &["dpkg-query", "dpkg-deb"]))
+            }
+        }
+    }
+    ensure_dependencies_for(&dependencies, distribution)?;
 
-    show_summary(config, needs_ext4_sync);
+    show_summary(config, distribution, needs_ext4_sync);
 
     if !confirm_or_yes("Generate and install systemd units?", true, yes)? {
         println!("Aborted.");
@@ -44,21 +76,22 @@ pub fn run(config: &Config, yes: bool, dry_run: bool) -> Result<()> {
     install_binary(config, dry_run)?;
 
     step(2, total_steps, "Setup wsl.conf boot command");
-    update_wsl_conf(dry_run)?;
+    update_wsl_conf(config_path, dry_run)?;
 
     step(3, total_steps, "Generate systemd mount units");
     generate_systemd_units(config, dry_run)?;
 
     step(4, total_steps, "Generate btrbk configuration");
-    generate_btrbk_config(config, dry_run)?;
-
-    step(5, total_steps, "Enable systemd services");
-    enable_services(config, dry_run)?;
+    generate_btrbk_config(config, config_path, dry_run)?;
 
     if needs_ext4_sync {
-        step(6, total_steps, "Setup ext4 systemd sync");
-        setup_ext4_sync(config, dry_run)?;
+        step(5, total_steps, "Setup ext4 systemd sync");
+        setup_ext4_sync(config, distribution, config_path, dry_run)?;
+        step(6, total_steps, "Enable systemd services");
+    } else {
+        step(5, total_steps, "Enable systemd services");
     }
+    enable_services(config, dry_run)?;
 
     println!();
     println!("{}", style("Mount setup complete!").green().bold());
@@ -68,7 +101,7 @@ pub fn run(config: &Config, yes: bool, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn show_summary(config: &Config, needs_ext4_sync: bool) {
+fn show_summary(config: &Config, distribution: Distribution, needs_ext4_sync: bool) {
     println!();
     println!("{}", style("Files to generate:").bold());
 
@@ -95,59 +128,116 @@ fn show_summary(config: &Config, needs_ext4_sync: bool) {
     if needs_ext4_sync {
         let ext4_unit = ext4_sync::ext4_mount_unit_filename(config);
         println!("  {}/{}", SYSTEMD_DIR, ext4_unit);
-        println!("  {}", PACMAN_HOOK_PATH);
+        let (hook_path, _) = ext4_sync::generate_package_hook(distribution, &[]);
+        println!("  {}", hook_path);
     }
 
     println!();
 }
 
-/// Install wslarc binary to /usr/local/bin (ext4 and @usr subvolume)
+/// Install wslarc binary to /usr/local/bin and the configured /usr subvolume.
 fn install_binary(config: &Config, dry_run: bool) -> Result<()> {
     let current_exe = std::env::current_exe()?;
-    let current_path = current_exe.to_string_lossy();
-
-    // Skip if already running from target location
-    if current_path == WSLARC_BIN {
-        success("wslarc already installed");
-        return Ok(());
-    }
 
     if dry_run {
         info(&format!(
-            "[dry-run] Would copy {} to {}",
-            current_exe.display(),
+            "[dry-run] Would ensure {} is installed and copy it to the configured /usr subvolume",
             WSLARC_BIN
         ));
         return Ok(());
     }
 
-    // Create directory if needed
-    fs::create_dir_all("/usr/local/bin")?;
+    let root = find_mount("/")?.context("Root filesystem is not mounted")?;
+    let usr_mounted = find_mount("/usr")?.is_some();
+    let ext4 = if usr_mounted {
+        find_mount(&config.ext4_sync.mount_point)?
+    } else {
+        None
+    };
+    let mut targets = vec![ext4_binary_path(config, &root, usr_mounted, ext4.as_ref())?];
 
-    // Remove old binary first (can't overwrite running executable)
-    let _ = fs::remove_file(WSLARC_BIN);
-
-    // Copy binary to ext4
-    fs::copy(&current_exe, WSLARC_BIN)?;
-    run_or_dry("chmod", &["+x", WSLARC_BIN], false)?;
-
-    // Also copy to @usr subvolume if mounted
-    let btrfs_bin = format!("{}/@usr/local/bin/wslarc", config.mount.base);
-    let btrfs_bin_dir = format!("{}/@usr/local/bin", config.mount.base);
-    if Path::new(&format!("{}/@usr", config.mount.base)).exists() {
-        fs::create_dir_all(&btrfs_bin_dir)?;
-        let _ = fs::remove_file(&btrfs_bin);
-        fs::copy(&current_exe, &btrfs_bin)?;
-        run_or_dry("chmod", &["+x", &btrfs_bin], false)?;
+    // Also copy to the configured /usr subvolume if it is mounted.
+    if let Some(usr_subvol) = usr_subvol_name(config) {
+        let base = find_mount(&config.mount.base)?;
+        verify_mount(
+            base.as_ref(),
+            &config.mount.base,
+            "btrfs",
+            config.uuid.as_deref().context("Btrfs UUID is missing")?,
+        )?;
+        let subvol_path = Path::new(&config.mount.base).join(usr_subvol);
+        if !subvol_path
+            .canonicalize()?
+            .starts_with(Path::new(&config.mount.base).canonicalize()?)
+        {
+            bail!("Configured /usr subvolume is outside the Btrfs base");
+        }
+        run_or_dry(
+            "btrfs",
+            &["subvolume", "show", &subvol_path.to_string_lossy()],
+            false,
+        )?;
+        targets.push(subvol_path.join("local/bin/wslarc"));
     }
+    install_copies(&current_exe, &targets)?;
 
     success(&format!("wslarc installed to {}", WSLARC_BIN));
     Ok(())
 }
 
-const WSLARC_ATTACH_CMD: &str = "/usr/local/bin/wslarc attach";
+fn ext4_binary_path(
+    config: &Config,
+    root: &MountInfo,
+    usr_mounted: bool,
+    ext4: Option<&MountInfo>,
+) -> Result<PathBuf> {
+    let uuid = root
+        .uuid
+        .as_deref()
+        .context("Root filesystem UUID is unavailable")?;
+    verify_mount(Some(root), "/", "ext4", uuid)?;
+    if !usr_mounted {
+        return Ok(PathBuf::from(WSLARC_BIN));
+    }
+    verify_mount(ext4, &config.ext4_sync.mount_point, "ext4", uuid).context(
+        "Mount the ext4 root at the configured ext4_sync.mount_point before updating wslarc",
+    )?;
+    if ext4.is_some_and(|mount| mount.source != root.source) {
+        bail!("The ext4 sync mount must expose the whole root filesystem, not a subdirectory");
+    }
+    Ok(Path::new(&config.ext4_sync.mount_point).join("usr/local/bin/wslarc"))
+}
 
-fn update_wsl_conf(dry_run: bool) -> Result<()> {
+fn validate_automation_config_path(config: &Config, path: &Path) -> Result<()> {
+    if !path.is_absolute() || path.to_string_lossy().chars().any(char::is_control) {
+        bail!("Automation requires an absolute configuration path without control characters");
+    }
+    let blocked = std::iter::once(config.mount.base.as_str())
+        .chain(config.subvolumes.backup.values().map(|entry| entry.mount()))
+        .chain(
+            config
+                .subvolumes
+                .transfer
+                .values()
+                .map(|entry| entry.mount.as_str()),
+        )
+        .chain([
+            "/tmp",
+            "/run",
+            "/var/tmp",
+            config.ext4_sync.mount_point.as_str(),
+        ]);
+    if blocked.into_iter().any(|mount| path.starts_with(mount)) {
+        bail!(
+            "Configuration must be on persistent ext4 storage available before managed mounts: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn update_wsl_conf(config_path: &str, dry_run: bool) -> Result<()> {
+    let attach_cmd = format!("{} attach", invocation::shell_command(config_path));
     if dry_run {
         info(&format!(
             "[dry-run] Would update {} with [boot] command",
@@ -160,7 +250,7 @@ fn update_wsl_conf(dry_run: bool) -> Result<()> {
 
     if let Some(boot) = conf.section(Some("boot")) {
         if let Some(cmd) = boot.get("command") {
-            if cmd == WSLARC_ATTACH_CMD {
+            if cmd == attach_cmd {
                 success("wsl.conf already configured");
                 return Ok(());
             }
@@ -168,8 +258,7 @@ fn update_wsl_conf(dry_run: bool) -> Result<()> {
         }
     }
 
-    conf.with_section(Some("boot"))
-        .set("command", WSLARC_ATTACH_CMD);
+    conf.with_section(Some("boot")).set("command", attach_cmd);
 
     conf.write_to_file(WSL_CONF)?;
     success("wsl.conf updated with boot command");
@@ -223,7 +312,7 @@ fn generate_systemd_units(config: &Config, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn generate_btrbk_config(config: &Config, dry_run: bool) -> Result<()> {
+fn generate_btrbk_config(config: &Config, config_path: &str, dry_run: bool) -> Result<()> {
     // Create /etc/btrbk directory
     if !dry_run {
         fs::create_dir_all("/etc/btrbk")?;
@@ -241,7 +330,7 @@ fn generate_btrbk_config(config: &Config, dry_run: bool) -> Result<()> {
     success("btrbk.conf created and validated");
 
     // Generate btrbk.service
-    let service_content = btrbk::generate_service(config);
+    let service_content = btrbk::generate_service(config, config_path);
     write_systemd_unit("btrbk.service", &service_content, dry_run)?;
     success("btrbk.service created");
 
@@ -277,6 +366,12 @@ fn enable_services(config: &Config, dry_run: bool) -> Result<()> {
     // Enable btrbk timer
     run_or_dry("systemctl", &["enable", "btrbk.timer"], dry_run)?;
 
+    // Enable the ext4 root mount after its unit file has been generated.
+    if has_usr_subvol(config) {
+        let ext4_unit = ext4_sync::ext4_mount_unit_filename(config);
+        run_or_dry("systemctl", &["enable", &ext4_unit], dry_run)?;
+    }
+
     success("All services enabled");
     Ok(())
 }
@@ -302,7 +397,12 @@ fn write_systemd_unit(filename: &str, content: &str, dry_run: bool) -> Result<()
     write_file(&path, content, dry_run)
 }
 
-fn setup_ext4_sync(config: &Config, dry_run: bool) -> Result<()> {
+fn setup_ext4_sync(
+    config: &Config,
+    distribution: Distribution,
+    config_path: &str,
+    dry_run: bool,
+) -> Result<()> {
     let ext4_uuid = ext4_sync::get_ext4_root_uuid()
         .ok_or_else(|| anyhow::anyhow!("Could not get ext4 root UUID"))?;
     info(&format!("ext4 root UUID: {}", ext4_uuid));
@@ -317,10 +417,126 @@ fn setup_ext4_sync(config: &Config, dry_run: bool) -> Result<()> {
     write_systemd_unit(&mount_unit_name, &mount_unit, dry_run)?;
     success(&format!("{} created", mount_unit_name));
 
-    let hook_targets = ext4_sync::collect_hook_targets()?;
-    let hook = ext4_sync::generate_pacman_hook(&hook_targets);
-    write_file(PACMAN_HOOK_PATH, &hook, dry_run)?;
-    success("pacman hook created");
+    if !dry_run {
+        info("Validating ext4 mount unit...");
+        let unit_path = format!("{}/{}", SYSTEMD_DIR, mount_unit_name);
+        run_or_dry("systemd-analyze", &["verify", &unit_path], false)?;
+    }
+
+    let hook_targets = ext4_sync::collect_hook_targets(distribution)?;
+    let (hook_path, hook) = configured_package_hook(distribution, &hook_targets, config_path);
+    write_file(hook_path, &hook, dry_run)?;
+    success(&format!(
+        "{} package hook created",
+        distribution.display_name()
+    ));
 
     Ok(())
+}
+
+fn configured_package_hook(
+    distribution: Distribution,
+    targets: &[String],
+    config_path: &str,
+) -> (&'static str, String) {
+    let (hook_path, hook) = ext4_sync::generate_package_hook(distribution, targets);
+    let command = invocation::shell_command(config_path);
+    let command = if distribution == Distribution::Debian {
+        command.replace('\\', "\\\\").replace('"', "\\\"")
+    } else {
+        command
+    };
+    (hook_path, hook.replace(WSLARC_BIN, &command))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        configured_package_hook, ext4_binary_path, usr_subvol_name,
+        validate_automation_config_path, MountInfo,
+    };
+    use crate::config::{BackupSubvol, Config, Distribution};
+    use std::path::Path;
+
+    #[test]
+    fn usr_subvolume_uses_configured_key() {
+        let mut config = Config::for_distribution(Distribution::Arch);
+        let usr = config.subvolumes.backup.remove("@usr").unwrap();
+        config
+            .subvolumes
+            .backup
+            .insert("@system_usr".to_string(), usr);
+
+        assert_eq!(usr_subvol_name(&config), Some("@system_usr"));
+    }
+
+    #[test]
+    fn usr_subvolume_ignores_other_mounts() {
+        let mut config = Config::for_distribution(Distribution::Arch);
+        config.subvolumes.backup.insert(
+            "@data".to_string(),
+            BackupSubvol::Simple("/data".to_string()),
+        );
+
+        assert_eq!(usr_subvol_name(&config), Some("@usr"));
+    }
+
+    #[test]
+    fn automation_config_must_be_available_before_managed_mounts() {
+        let config = Config::for_distribution(Distribution::Arch);
+        assert!(validate_automation_config_path(&config, Path::new("/etc/custom.toml")).is_ok());
+        for path in [
+            "/usr/local/config.toml",
+            "/mnt/btrfs/config.toml",
+            "/tmp/config.toml",
+            "/etc/a\nb",
+        ] {
+            assert!(validate_automation_config_path(&config, Path::new(path)).is_err());
+        }
+    }
+
+    #[test]
+    fn generated_hooks_keep_the_selected_config() {
+        let path = "/etc/wslarc/custom config.toml";
+        let (_, arch) = configured_package_hook(Distribution::Arch, &[], path);
+        let (_, debian) = configured_package_hook(Distribution::Debian, &[], path);
+        assert!(arch.contains("--config '/etc/wslarc/custom config.toml'"));
+        assert_eq!(
+            debian
+                .matches("--config '/etc/wslarc/custom config.toml'")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn binary_install_selects_verified_hidden_ext4_root() {
+        let config = Config::for_distribution(Distribution::Arch);
+        let root = MountInfo {
+            target: "/".into(),
+            source: "/dev/root".into(),
+            fstype: "ext4".into(),
+            options: "rw".into(),
+            uuid: Some("root-id".into()),
+        };
+        let mut ext4 = root.clone();
+        ext4.target = config.ext4_sync.mount_point.clone();
+        assert_eq!(
+            ext4_binary_path(&config, &root, true, Some(&ext4)).unwrap(),
+            Path::new(&config.ext4_sync.mount_point).join("usr/local/bin/wslarc")
+        );
+        assert!(ext4_binary_path(&config, &root, true, None).is_err());
+        ext4.uuid = Some("wrong".into());
+        assert!(ext4_binary_path(&config, &root, true, Some(&ext4)).is_err());
+        assert_eq!(
+            ext4_binary_path(&config, &root, false, None).unwrap(),
+            Path::new("/usr/local/bin/wslarc")
+        );
+    }
+
+    #[test]
+    fn apt_hook_escapes_config_for_both_shell_and_apt_string() {
+        let (_, hook) = configured_package_hook(Distribution::Debian, &[], "/etc/a'b\"c.toml");
+        assert!(hook.contains(r#"/etc/a'\\''b\"c.toml"#));
+    }
 }
