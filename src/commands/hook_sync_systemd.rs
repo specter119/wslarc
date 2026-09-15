@@ -50,11 +50,20 @@ pub fn run_apt_post(config: &Config, distribution: Distribution, dry_run: bool) 
     let targets = ext4_sync::collect_hook_targets(distribution)?;
     let current_state = installed_package_state(distribution, &targets)?;
     let previous_state = read_state(Path::new(ext4_sync::APT_SYNC_STATE))?;
-    let state_changed = previous_state.as_deref() != Some(current_state.as_str());
+    // A missing state file means this is the first observation, not that the
+    // systemd package set changed. Only an existing, different state requires
+    // a full refresh (for example after a package removal).
+    let state_changed = previous_state
+        .as_deref()
+        .is_some_and(|previous| previous != current_state);
 
     if triggered.is_empty() {
         if !state_changed {
             info("No APT packages require ext4 synchronization");
+            if !dry_run {
+                write_state(Path::new(ext4_sync::APT_SYNC_STATE), &current_state)?;
+                clear_pending(pending_path)?;
+            }
             return Ok(());
         }
         info("The installed systemd package set changed; refreshing ext4 sync");
@@ -223,7 +232,7 @@ fn finish_apt_post<F>(
 where
     F: FnOnce(&[String]) -> Result<()>,
 {
-    let state_changed = previous_state != Some(current_state);
+    let state_changed = previous_state.is_some_and(|previous| previous != current_state);
     let sync_triggers: &[String] = if state_changed { &[] } else { triggered };
     sync(sync_triggers)?;
 
@@ -836,6 +845,34 @@ mod tests {
             vec!["systemd".to_string()]
         );
         assert_eq!(fs::read_to_string(&state).unwrap(), "systemd=256.4-1");
+    }
+
+    #[test]
+    fn apt_initial_observation_does_not_force_full_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let pending = directory.path().join("apt-pending");
+        let state = directory.path().join("apt-state");
+        write_package_file(&pending, &["curl".to_string()]).unwrap();
+        let called = Cell::new(false);
+
+        finish_apt_post(
+            &pending,
+            &state,
+            &["curl".to_string()],
+            "systemd=256.5-1",
+            None,
+            false,
+            |triggers| {
+                called.set(true);
+                assert_eq!(triggers, &["curl".to_string()]);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(called.get());
+        assert_eq!(fs::read_to_string(&state).unwrap(), "systemd=256.5-1");
+        assert!(!pending.exists());
     }
 
     #[test]

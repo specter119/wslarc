@@ -120,6 +120,10 @@ such as `/etc/wslarc/custom.toml`, not under `/usr`, a managed home directory,
 the Btrfs base, or a temporary directory. Rerun `mount` after changing the
 configuration path.
 
+The boot-time `wslarc attach` command retries once when binfmt or VHDX
+attachment fails. Before the retry, it repairs the `WSLInterop` binfmt rule
+and refreshes `systemd-binfmt`; a second failure is returned.
+
 When `/usr` is already mounted separately, mount the configured ext4 root
 before updating wslarc. The installer verifies that it is the same ext4
 filesystem as `/`, then stages and atomically replaces both binary copies.

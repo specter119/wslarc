@@ -511,7 +511,16 @@ fn parse_pacman_depends(output: &str) -> Vec<String> {
 
 fn parse_debian_status_version(output: &str) -> Option<String> {
     let (status, version) = output.trim().split_once('\t')?;
-    if status.split_whitespace().last() != Some("installed") {
+    let package_state = status.split_whitespace().last()?;
+    if !matches!(
+        package_state,
+        "installed"
+            | "half-installed"
+            | "unpacked"
+            | "half-configured"
+            | "triggers-awaited"
+            | "triggers-pending"
+    ) {
         return None;
     }
 
@@ -765,7 +774,7 @@ Optional Deps   : None\n";
     }
 
     #[test]
-    fn parse_debian_status_version_only_accepts_installed_packages() {
+    fn parse_debian_status_version_accepts_present_package_states() {
         assert_eq!(
             parse_debian_status_version("install ok installed\t1.2.3\n"),
             Some("1.2.3".to_string())
@@ -774,8 +783,24 @@ Optional Deps   : None\n";
             parse_debian_status_version("hold ok installed\t1.2.3\n"),
             Some("1.2.3".to_string())
         );
+        for state in [
+            "half-installed",
+            "unpacked",
+            "half-configured",
+            "triggers-awaited",
+            "triggers-pending",
+        ] {
+            assert_eq!(
+                parse_debian_status_version(&format!("install ok {state}\t1.2.3\n")),
+                Some("1.2.3".to_string())
+            );
+        }
         assert_eq!(
             parse_debian_status_version("deinstall ok config-files\t1.2.3\n"),
+            None
+        );
+        assert_eq!(
+            parse_debian_status_version("unknown ok not-installed\t1.2.3\n"),
             None
         );
     }
