@@ -100,6 +100,7 @@ fn default_common_backup() -> HashMap<String, BackupSubvol> {
     let mut backup = HashMap::new();
     backup.insert("@usr".to_string(), BackupSubvol::Simple("/usr".to_string()));
     backup.insert("@opt".to_string(), BackupSubvol::Simple("/opt".to_string()));
+    backup.insert("@nix".to_string(), BackupSubvol::Simple("/nix".to_string()));
     backup
 }
 
@@ -262,7 +263,7 @@ fn default_base_options() -> String {
 
 /// A-class backup subvolume config
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum BackupSubvol {
     /// Simple form: just the mount point string
     Simple(String),
@@ -507,6 +508,18 @@ mod tests {
     }
 
     #[test]
+    fn test_removed_seed_field_is_rejected() {
+        let error = toml::from_str::<BackupSubvol>(
+            r#"mount = "/nix"
+seed = false
+"#,
+        )
+        .unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
     fn test_set_user_expands_variables() {
         let mut cfg = Config::default();
         cfg.set_user("alice");
@@ -585,6 +598,7 @@ base = "/mnt/test"
 
 [subvolumes.backup]
 "@home" = "/home/testuser"
+"@nix" = "/nix"
 
 [subvolumes.exclude]
 parent = "@home"
@@ -608,6 +622,7 @@ timer_schedule = "*-*-* 02:00:00"
         assert_eq!(cfg.mount.base, "/mnt/test");
         assert_eq!(cfg.btrbk.preserve_min, "1d");
         assert!(cfg.subvolumes.backup.contains_key("@home"));
+        assert_eq!(cfg.subvolumes.backup.get("@nix").unwrap().mount(), "/nix");
     }
 
     #[test]
@@ -646,6 +661,8 @@ timer_schedule = "*-*-* 02:00:00"
         assert_eq!(loaded.vhdx.path, cfg.vhdx.path);
         assert_eq!(loaded.uuid, cfg.uuid);
         assert!(!saved.contains("distribution"));
+        assert!(!saved.contains("seed"));
+        assert!(saved.contains("\"@nix\" = \"/nix\""));
     }
 
     #[test]

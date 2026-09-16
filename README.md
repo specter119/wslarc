@@ -88,21 +88,34 @@ sudo wslarc init
 # With custom config
 sudo wslarc init --config /path/to/config.toml
 
-# Silent mode (use defaults)
+# Use saved configuration non-interactively
 sudo wslarc init --yes
 ```
 
 Initialization saves the selected configuration path, preserving `$USER`
-templates for later loads. It creates nested exclusion subvolumes before
-copying home data, and seeds transfer subvolumes after applying `nodatacow`.
-Source directories are not deleted.
+templates for later loads. It creates configured subvolumes and prints an
+rsync plan before copying data.
 
-Stop applications that write to migration sources first, especially containers.
-Initialization records seed progress in `.wslarc-init-progress.toml` at the
-Btrfs root so interrupted copies can be retried. It does not overwrite an
-untracked populated target, and refuses to mistake an ordinary directory for
-a Btrfs subvolume. Existing installations with ordinary exclusion directories
-need an explicit data-preserving migration before reinitialization.
+On the first initialization, `/home` and `/nix` are created but are not copied
+over existing WSL directories. `/usr`, `/opt`, the distribution package
+database, snapshot-only sources such as `/etc`, and transfer subvolumes are
+included in the first-run plan. Even with `--yes`, the first initialization
+still asks for the synchronization confirmation. A non-empty target receives
+an additional warning and confirmation.
+
+When the configuration already exists, `init` checks each target subvolume.
+Snapshot-only sources are synchronized even when their targets are non-empty.
+Backup and transfer sources are synchronized only when their targets are new
+or empty; non-empty targets are listed as skipped without a warning.
+
+Rsync output is streamed to the terminal. If the user interrupts a copy,
+`init` prints a complete recovery command that temporarily mounts the Btrfs
+top-level subvolume and resumes the remaining rsync operations with
+`--partial`. No initialization progress file is retained.
+
+Stop applications that write to migration sources first, especially
+containers. Source directories are never deleted. Initialization refuses to
+mistake an ordinary directory for a Btrfs subvolume.
 
 ### Generate systemd mount units
 
@@ -284,12 +297,15 @@ base = "/mnt/btrfs"
 # `wslarc init` detects the distribution and writes the complete template.
 # The saved subvolume sections are the source of truth and can be edited.
 
-# A-class: Backup targets (simple form)
+# A-class: Backup targets
 [subvolumes.backup]
 "@usr" = "/usr"
 "@opt" = "/opt"
 "@home" = "/home/$USER"
+"@nix" = "/nix"
 # Arch adds @var_lib_pacman; Debian adds @var_lib_dpkg and @var_lib_apt.
+# First-init synchronization behavior is built into `wslarc init`; it is not
+# stored in the runtime configuration.
 
 # Snapshot-only subvolume
 [subvolumes.snapshot_only."@etc"]

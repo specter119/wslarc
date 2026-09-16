@@ -1,7 +1,5 @@
 use anyhow::{bail, Context, Error, Result};
 use console::style;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -11,8 +9,7 @@ use crate::utils::cli::{
     read_block_device, Dependency,
 };
 use crate::utils::prompt::{self, confirm_or_yes, info, input, step, success, warn};
-use crate::utils::shell::{run as shell_run, run_or_dry};
-use crate::utils::storage::atomic_write;
+use crate::utils::shell::{run as shell_run, run_or_dry, run_with_output_interruptible};
 
 pub fn run(
     config: &Config,
@@ -23,16 +20,19 @@ pub fn run(
 ) -> Result<()> {
     println!("{}", style("WSL Btrfs Initialization").bold().cyan());
 
+    let first_init = !Path::new(config_path).exists();
+    let confirm_yes = allows_noninteractive_confirmation(config_path, yes);
+
     // Check if already initialized
-    if Path::new(config_path).exists() && config.uuid.is_some() {
+    if !first_init && config.uuid.is_some() {
         warn("Configuration already exists with UUID. Re-running will overwrite.");
-        if !confirm_or_yes("Continue anyway?", false, yes)? {
+        if !confirm_or_yes("Continue anyway?", false, confirm_yes)? {
             return Ok(());
         }
     }
 
     // Collect configuration (interactive or from file)
-    let mut cfg = if yes {
+    let mut cfg = if confirm_yes {
         config.clone()
     } else {
         collect_config(config, distribution)?
@@ -52,7 +52,7 @@ pub fn run(
     show_summary(&cfg, distribution);
 
     // Confirm before proceeding
-    if !confirm_or_yes("Proceed with initialization?", true, yes)? {
+    if !confirm_or_yes("Proceed with initialization?", true, confirm_yes)? {
         println!("Aborted.");
         return Ok(());
     }
@@ -71,7 +71,7 @@ pub fn run(
     info(&format!("Device: {}", device));
 
     step(3, total_steps, "Format as Btrfs");
-    format_btrfs(&mut runtime_cfg, &device, dry_run, yes)?;
+    format_btrfs(&mut runtime_cfg, &device, dry_run, confirm_yes)?;
 
     step(4, total_steps, "Get filesystem UUID");
     let uuid = get_uuid(&device, dry_run)?;
@@ -81,7 +81,14 @@ pub fn run(
     success(&format!("UUID: {}", uuid));
 
     step(5, total_steps, "Create subvolumes");
-    create_subvolumes(&cfg, &runtime_cfg, &device, dry_run)?;
+    create_subvolumes(
+        &cfg,
+        &runtime_cfg,
+        &device,
+        first_init,
+        confirm_yes,
+        dry_run,
+    )?;
 
     step(6, total_steps, "Save configuration");
     if !dry_run {
@@ -108,6 +115,10 @@ pub fn run(
     );
 
     Ok(())
+}
+
+fn allows_noninteractive_confirmation(config_path: &str, yes: bool) -> bool {
+    yes && Path::new(config_path).exists()
 }
 
 fn check_runtime_dependencies(config: &Config, distribution: Distribution) -> Result<()> {
@@ -157,6 +168,9 @@ fn collect_config(base: &Config, distribution: Distribution) -> Result<Config> {
     println!("  Backup, exclude, transfer, and snapshot-only entries are editable");
     println!("  B-class (exclude): .cache, .local, .npm, .bun, .vscode-server-insiders");
     println!("  C-class (transfer): @containers, @var_cache, @var_log, @var_tmp");
+    println!(
+        "  First initialization skips /home and /nix; existing configs use target-state checks"
+    );
 
     Ok(cfg)
 }
@@ -337,61 +351,72 @@ struct SystemInitCommandRunner;
 
 impl InitCommandRunner for SystemInitCommandRunner {
     fn run(&mut self, command: &str, args: &[&str]) -> Result<String> {
-        shell_run(command, args)
+        if command == "rsync" {
+            run_with_output_interruptible(command, args)?;
+            Ok(String::new())
+        } else {
+            shell_run(command, args)
+        }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct InitProgress {
-    #[serde(default)]
-    seeds: HashMap<String, SeedProgress>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncKind {
+    Backup,
+    SnapshotOnly,
+    Transfer,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SeedProgress {
+impl SyncKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Backup => "backup",
+            Self::SnapshotOnly => "snapshot-only",
+            Self::Transfer => "transfer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetState {
+    Empty,
+    NonEmpty,
+    Unknown,
+}
+
+impl TargetState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::NonEmpty => "non-empty",
+            Self::Unknown => "not inspected (dry-run)",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SyncPlanEntry {
+    subvol: String,
     source: String,
     target: String,
-    status: SeedStatus,
+    kind: SyncKind,
+    excluded_paths: Vec<String>,
+    state: TargetState,
+    copy: bool,
+    reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum SeedStatus {
-    Incomplete,
-    Complete,
-}
-
-const INIT_PROGRESS_FILE: &str = ".wslarc-init-progress.toml";
-
-impl InitProgress {
-    fn load(mount_point: &str) -> Result<Self> {
-        let path = Path::new(mount_point).join(INIT_PROGRESS_FILE);
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-
-        let content = fs::read_to_string(&path).with_context(|| {
-            format!("Failed to read initialization progress: {}", path.display())
-        })?;
-        toml::from_str(&content).with_context(|| {
-            format!(
-                "Failed to parse initialization progress: {}",
-                path.display()
-            )
-        })
-    }
-
-    fn save(&self, mount_point: &str) -> Result<()> {
-        let path = Path::new(mount_point).join(INIT_PROGRESS_FILE);
-        let content =
-            toml::to_string_pretty(self).context("Failed to serialize initialization progress")?;
-        atomic_write(&path, content.as_bytes()).with_context(|| {
-            format!(
-                "Failed to write initialization progress: {}",
-                path.display()
-            )
-        })
-    }
+struct PlanRequest<'a> {
+    mount_point: &'a str,
+    subvol: &'a str,
+    source: &'a str,
+    kind: SyncKind,
+    excluded_paths: Vec<String>,
+    requested: bool,
+    requested_reason: Option<String>,
+    ignored_children: &'a [String],
+    allow_nonempty: bool,
+    dry_run: bool,
 }
 
 fn run_init_command(
@@ -405,39 +430,6 @@ fn run_init_command(
     } else {
         runner.run(command, args)
     }
-}
-
-fn prepare_seed(
-    mount_point: &str,
-    subvol: &str,
-    source: &str,
-    progress: &mut InitProgress,
-) -> Result<()> {
-    let target = format!("{}/{}", mount_point, subvol);
-    let target_is_empty = Path::new(&target).exists()
-        && fs::read_dir(&target)
-            .with_context(|| format!("Failed to inspect seed target {}", target))?
-            .next()
-            .is_none();
-    let matching_state = progress
-        .seeds
-        .get(subvol)
-        .filter(|seed| seed.source == source && seed.target == target)
-        .map(|seed| seed.status);
-
-    if target_is_empty && matching_state != Some(SeedStatus::Incomplete) {
-        progress.seeds.insert(
-            subvol.to_string(),
-            SeedProgress {
-                source: source.to_string(),
-                target,
-                status: SeedStatus::Incomplete,
-            },
-        );
-        progress.save(mount_point)?;
-    }
-
-    Ok(())
 }
 
 fn cleanup_setup_mount<F, G>(
@@ -485,6 +477,8 @@ fn create_subvolumes(
     config: &Config,
     runtime_config: &Config,
     device: &str,
+    first_init: bool,
+    confirm_yes: bool,
     dry_run: bool,
 ) -> Result<()> {
     let mount_point = "/mnt/btrfs-setup";
@@ -501,8 +495,15 @@ fn create_subvolumes(
     }
 
     let mut runner = SystemInitCommandRunner;
-    let mut result =
-        create_all_subvolumes_with_runner(runtime_config, mount_point, dry_run, &mut runner);
+    let mut result = create_all_subvolumes_with_runner(
+        runtime_config,
+        device,
+        mount_point,
+        first_init,
+        confirm_yes,
+        dry_run,
+        &mut runner,
+    );
 
     // Save config alongside the snapshot-only /etc source before umounting.
     if !dry_run && result.is_ok() {
@@ -546,16 +547,13 @@ fn create_subvolumes(
 
 fn create_all_subvolumes_with_runner(
     cfg: &Config,
+    device: &str,
     mount_point: &str,
+    first_init: bool,
+    confirm_yes: bool,
     dry_run: bool,
     runner: &mut dyn InitCommandRunner,
 ) -> Result<()> {
-    let mut progress = if dry_run {
-        InitProgress::default()
-    } else {
-        InitProgress::load(mount_point)?
-    };
-
     info("Creating configured A-class backup subvolumes...");
     for subvol in cfg.subvolumes.backup.keys() {
         create_subvolume_with_runner(mount_point, subvol, dry_run, runner)?;
@@ -566,37 +564,14 @@ fn create_all_subvolumes_with_runner(
         create_subvolume_with_runner(mount_point, subvol, dry_run, runner)?;
     }
 
-    // Establish nested B-class subvolumes before seeding @home. Rsync then
+    // Establish nested B-class subvolumes before building the home sync plan.
+    // Rsync then
     // traverses the already-created nested targets and preserves their source
     // contents instead of copying a populated home over their mount points.
     info("Creating configured B-class nested subvolumes...");
     let parent = &cfg.subvolumes.exclude.parent;
     let user = cfg.get_user();
-    let nested_sources: Vec<(String, String)> = cfg
-        .subvolumes
-        .backup
-        .get(parent)
-        .map(|backup| {
-            cfg.subvolumes
-                .exclude
-                .paths
-                .iter()
-                .map(|path| {
-                    let nested = format!("{}/{}", parent, path);
-                    let source = format!(
-                        "{}/{}",
-                        backup.mount().trim_end_matches('/'),
-                        path.trim_start_matches('/')
-                    );
-                    (nested, source)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     create_subvolume_with_runner(mount_point, parent, dry_run, runner)?;
-    if let Some(backup) = cfg.subvolumes.backup.get(parent).filter(|_| !dry_run) {
-        prepare_seed(mount_point, parent, backup.mount(), &mut progress)?;
-    }
     for path in &cfg.subvolumes.exclude.paths {
         let nested = format!("{}/{}", parent, path);
         create_subvolume_with_runner(mount_point, &nested, dry_run, runner)?;
@@ -649,58 +624,384 @@ fn create_all_subvolumes_with_runner(
         }
     }
 
-    // Seed after all nested and transfer subvolumes exist, and after C-class
-    // nodatacow is set. Sources are never removed or cleaned. Pre-register
-    // fresh targets before nested content can make their parents non-empty;
-    // an untracked populated target is never treated as resumable.
-    let mut seed_sources = nested_sources.clone();
-    seed_sources.extend(
-        cfg.subvolumes
-            .backup
-            .iter()
-            .map(|(subvol, backup)| (subvol.clone(), backup.mount().to_string())),
-    );
-    seed_sources.extend(
-        cfg.subvolumes
-            .snapshot_only
-            .iter()
-            .map(|(subvol, snapshot)| (subvol.clone(), snapshot.source.clone())),
-    );
-    seed_sources.extend(
-        cfg.subvolumes
-            .transfer
-            .iter()
-            .map(|(subvol, transfer)| (subvol.clone(), transfer.mount.clone())),
-    );
-    if !dry_run {
-        for (subvol, source) in &seed_sources {
-            prepare_seed(mount_point, subvol, source, &mut progress)?;
-        }
-    }
-
-    for (subvol, source) in &seed_sources {
-        let excluded_paths: &[String] = if subvol == parent {
-            &cfg.subvolumes.exclude.paths
-        } else {
-            &[]
-        };
-        seed_subvolume_with_excludes(
-            mount_point,
-            subvol,
-            source,
-            excluded_paths,
-            dry_run,
-            &mut progress,
-            runner,
-        )?;
-    }
-
     // Create the btrbk snapshot directory
     info("Creating snapshot directory...");
     create_subvolume_with_runner(mount_point, &cfg.btrbk.snapshot_dir, dry_run, runner)?;
 
+    let plan = build_sync_plan(cfg, mount_point, first_init, dry_run)?;
+    show_sync_plan(&plan);
+
+    let pending: Vec<SyncPlanEntry> = plan.iter().filter(|entry| entry.copy).cloned().collect();
+    if pending.is_empty() {
+        info("No rsync work is needed");
+        success("All subvolumes created");
+        return Ok(());
+    }
+
+    if !confirm_or_yes("Execute the rsync plan?", true, confirm_yes)? {
+        println!("Synchronization aborted; no rsync was started.");
+        success("All subvolumes created");
+        return Ok(());
+    }
+
+    execute_sync_plan(&pending, device, first_init, dry_run, runner)?;
+
     success("All subvolumes created");
     Ok(())
+}
+
+fn build_sync_plan(
+    cfg: &Config,
+    mount_point: &str,
+    first_init: bool,
+    dry_run: bool,
+) -> Result<Vec<SyncPlanEntry>> {
+    let parent = &cfg.subvolumes.exclude.parent;
+    let home_mount = format!("/home/{}", cfg.get_user());
+    let mut plan = Vec::new();
+
+    if first_init {
+        for (subvol, backup) in &cfg.subvolumes.backup {
+            let excluded_paths = if subvol == parent {
+                cfg.subvolumes.exclude.paths.clone()
+            } else {
+                Vec::new()
+            };
+            let enabled =
+                subvol != parent && backup.mount() != home_mount && backup.mount() != "/nix";
+            let reason = (!enabled).then(|| {
+                if backup.mount() == "/nix" {
+                    "disabled by first-init policy for /nix".to_string()
+                } else {
+                    "disabled by first-init policy for the home directory".to_string()
+                }
+            });
+            plan.push(make_plan_entry(PlanRequest {
+                mount_point,
+                subvol,
+                source: backup.mount(),
+                kind: SyncKind::Backup,
+                excluded_paths,
+                requested: enabled,
+                requested_reason: reason,
+                ignored_children: &[],
+                allow_nonempty: first_init,
+                dry_run,
+            })?);
+        }
+    } else {
+        if let Some(backup) = cfg.subvolumes.backup.get(parent) {
+            for path in &cfg.subvolumes.exclude.paths {
+                let nested = format!("{}/{}", parent, path);
+                let source = format!(
+                    "{}/{}",
+                    backup.mount().trim_end_matches('/'),
+                    path.trim_start_matches('/')
+                );
+                plan.push(make_plan_entry(PlanRequest {
+                    mount_point,
+                    subvol: &nested,
+                    source: &source,
+                    kind: SyncKind::Backup,
+                    excluded_paths: Vec::new(),
+                    requested: true,
+                    requested_reason: None,
+                    ignored_children: &[],
+                    allow_nonempty: false,
+                    dry_run,
+                })?);
+            }
+        }
+
+        for (subvol, backup) in &cfg.subvolumes.backup {
+            let excluded_paths = if subvol == parent {
+                cfg.subvolumes.exclude.paths.clone()
+            } else {
+                Vec::new()
+            };
+            let ignored_children = if subvol == parent {
+                cfg.subvolumes.exclude.paths.as_slice()
+            } else {
+                &[]
+            };
+            plan.push(make_plan_entry(PlanRequest {
+                mount_point,
+                subvol,
+                source: backup.mount(),
+                kind: SyncKind::Backup,
+                excluded_paths,
+                requested: true,
+                requested_reason: None,
+                ignored_children,
+                allow_nonempty: false,
+                dry_run,
+            })?);
+        }
+    }
+
+    for (subvol, snapshot) in &cfg.subvolumes.snapshot_only {
+        plan.push(make_plan_entry(PlanRequest {
+            mount_point,
+            subvol,
+            source: &snapshot.source,
+            kind: SyncKind::SnapshotOnly,
+            excluded_paths: Vec::new(),
+            requested: true,
+            requested_reason: None,
+            ignored_children: &[],
+            allow_nonempty: true,
+            dry_run,
+        })?);
+    }
+
+    for (subvol, transfer) in &cfg.subvolumes.transfer {
+        plan.push(make_plan_entry(PlanRequest {
+            mount_point,
+            subvol,
+            source: &transfer.mount,
+            kind: SyncKind::Transfer,
+            excluded_paths: Vec::new(),
+            requested: true,
+            requested_reason: None,
+            ignored_children: &[],
+            allow_nonempty: first_init,
+            dry_run,
+        })?);
+    }
+
+    Ok(plan)
+}
+
+fn make_plan_entry(request: PlanRequest<'_>) -> Result<SyncPlanEntry> {
+    let PlanRequest {
+        mount_point,
+        subvol,
+        source,
+        kind,
+        excluded_paths,
+        requested,
+        requested_reason,
+        ignored_children,
+        allow_nonempty,
+        dry_run,
+    } = request;
+    let target = format!("{}/{}", mount_point, subvol);
+    let state = inspect_target(&target, ignored_children, dry_run)?;
+    let source_exists = dry_run || Path::new(source).exists();
+
+    let (copy, reason) = if !requested {
+        (false, requested_reason)
+    } else if !source_exists {
+        (false, Some(format!("source does not exist: {}", source)))
+    } else if allow_nonempty
+        || matches!(kind, SyncKind::SnapshotOnly)
+        || matches!(state, TargetState::Empty | TargetState::Unknown)
+    {
+        (true, None)
+    } else {
+        (
+            false,
+            Some("target is non-empty; skipped for an existing configuration".to_string()),
+        )
+    };
+
+    Ok(SyncPlanEntry {
+        subvol: subvol.to_string(),
+        source: source.to_string(),
+        target,
+        kind,
+        excluded_paths,
+        state,
+        copy,
+        reason,
+    })
+}
+
+fn inspect_target(target: &str, ignored_children: &[String], dry_run: bool) -> Result<TargetState> {
+    if dry_run {
+        return Ok(TargetState::Unknown);
+    }
+    if !Path::new(target).exists() {
+        return Ok(TargetState::Empty);
+    }
+
+    let ignored: Vec<&str> = ignored_children
+        .iter()
+        .map(|path| path.trim_matches('/').split('/').next().unwrap_or(path))
+        .collect();
+    for entry in
+        fs::read_dir(target).with_context(|| format!("Failed to inspect sync target {}", target))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !ignored.iter().any(|path| *path == name) {
+            return Ok(TargetState::NonEmpty);
+        }
+    }
+    Ok(TargetState::Empty)
+}
+
+fn show_sync_plan(plan: &[SyncPlanEntry]) {
+    println!();
+    println!("{}", style("Rsync plan").bold());
+    if plan.is_empty() {
+        println!("  No configured sources");
+        return;
+    }
+
+    for entry in plan {
+        if entry.copy {
+            println!(
+                "  [sync] {} {} -> {} (target: {})",
+                entry.kind.label(),
+                entry.source,
+                entry.target,
+                entry.state.label()
+            );
+        } else if let Some(reason) = &entry.reason {
+            println!(
+                "  [skip] {} {} -> {} ({})",
+                entry.kind.label(),
+                entry.source,
+                entry.target,
+                reason
+            );
+        }
+    }
+    println!();
+}
+
+fn execute_sync_plan(
+    plan: &[SyncPlanEntry],
+    device: &str,
+    first_init: bool,
+    dry_run: bool,
+    runner: &mut dyn InitCommandRunner,
+) -> Result<()> {
+    let mut remaining = plan.to_vec();
+    while let Some(entry) = remaining.first().cloned() {
+        if first_init && entry.state == TargetState::NonEmpty {
+            warn(&format!(
+                "Target {} already contains data; it will be updated from {}.",
+                entry.target, entry.source
+            ));
+            if !prompt::confirm(
+                &format!(
+                    "Copy {} into non-empty target {}?",
+                    entry.source, entry.target
+                ),
+                false,
+            )? {
+                info(&format!("Skipped {}", entry.subvol));
+                remaining.remove(0);
+                continue;
+            }
+        }
+
+        if let Err(error) = run_sync_entry(&entry, dry_run, runner) {
+            print_resume_command(device, &remaining);
+            return Err(error);
+        }
+        remaining.remove(0);
+    }
+
+    Ok(())
+}
+
+fn run_sync_entry(
+    entry: &SyncPlanEntry,
+    dry_run: bool,
+    runner: &mut dyn InitCommandRunner,
+) -> Result<()> {
+    let mut args = vec![
+        "-aAX".to_string(),
+        "--partial".to_string(),
+        "--info=progress2".to_string(),
+    ];
+    if entry.kind == SyncKind::SnapshotOnly {
+        args.push("--delete".to_string());
+    }
+    for path in &entry.excluded_paths {
+        args.push("--exclude".to_string());
+        args.push(format!("/{}/", path.trim_matches('/')));
+    }
+    args.push(format!("{}/", entry.source.trim_end_matches('/')));
+    args.push(format!("{}/", entry.target.trim_end_matches('/')));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    info(&format!("Syncing {} -> {}", entry.source, entry.target));
+    run_init_command(runner, "rsync", &args, dry_run)?;
+    success(&format!("{} synced", entry.subvol));
+    Ok(())
+}
+
+fn print_resume_command(device: &str, pending: &[SyncPlanEntry]) {
+    let Some(command) = render_resume_command(device, pending) else {
+        return;
+    };
+
+    warn("Rsync stopped. Run the following command to resume the remaining sync:");
+    println!();
+    print!("{command}");
+}
+
+fn render_resume_command(device: &str, pending: &[SyncPlanEntry]) -> Option<String> {
+    let pending: Vec<&SyncPlanEntry> = pending.iter().filter(|entry| entry.copy).collect();
+    if pending.is_empty() {
+        return None;
+    }
+
+    let mut command = String::new();
+    command.push_str("set -e\n");
+    command.push_str("resume_root=$(mktemp -d /tmp/wslarc-resume.XXXXXX)\n");
+    command.push_str("cleanup() { sudo umount \"$resume_root\" >/dev/null 2>&1 || true; rmdir \"$resume_root\" 2>/dev/null || true; }\n");
+    command.push_str("trap cleanup EXIT\n");
+    command.push_str(&format!(
+        "sudo mount -o subvolid=5 {} \"$resume_root\"\n",
+        crate::generators::invocation::shell_argument(device)
+    ));
+
+    for entry in pending {
+        let mut args = vec![
+            "sudo".to_string(),
+            "rsync".to_string(),
+            "-aAX".to_string(),
+            "--partial".to_string(),
+            "--info=progress2".to_string(),
+        ];
+        if entry.kind == SyncKind::SnapshotOnly {
+            args.push("--delete".to_string());
+        }
+        for path in &entry.excluded_paths {
+            args.push("--exclude".to_string());
+            args.push(format!("/{}/", path.trim_matches('/')));
+        }
+        args.push(format!("{}/", entry.source.trim_end_matches('/')));
+        let target_suffix = format!("{}/", entry.subvol.trim_end_matches('/'));
+        args.push(target_suffix);
+        let rendered = args
+            .iter()
+            .enumerate()
+            .map(|(index, arg)| {
+                if index == args.len() - 1 {
+                    format!(
+                        "\"$resume_root\"/{}",
+                        crate::generators::invocation::shell_argument(arg)
+                    )
+                } else {
+                    crate::generators::invocation::shell_argument(arg)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        command.push_str(&rendered);
+        command.push('\n');
+    }
+    command.push_str(
+        "# The temporary subvolume-5 mount is cleaned up automatically when this shell exits.\n",
+    );
+    Some(command)
 }
 
 fn create_subvolume_with_runner(
@@ -726,114 +1027,6 @@ fn create_subvolume_with_runner(
 
     run_init_command(runner, "btrfs", &["subvolume", "create", &path], dry_run)?;
     info(&format!("  {} (created)", name));
-    Ok(())
-}
-
-/// Seed a subvolume without deleting or cleaning an existing source.
-///
-/// A populated target is copied into only when this initialization previously
-/// recorded an incomplete seed. Otherwise it is treated as pre-existing state
-/// and skipped safely. This prevents a retry from mistaking arbitrary content
-/// for a completed copy while also preventing destructive overwrite behavior.
-#[cfg(test)]
-fn seed_subvolume(
-    mount_point: &str,
-    subvol: &str,
-    source: &str,
-    dry_run: bool,
-    progress: &mut InitProgress,
-    runner: &mut dyn InitCommandRunner,
-) -> Result<()> {
-    seed_subvolume_with_excludes(mount_point, subvol, source, &[], dry_run, progress, runner)
-}
-
-fn seed_subvolume_with_excludes(
-    mount_point: &str,
-    subvol: &str,
-    source: &str,
-    excluded_paths: &[String],
-    dry_run: bool,
-    progress: &mut InitProgress,
-    runner: &mut dyn InitCommandRunner,
-) -> Result<()> {
-    let target = format!("{}/{}", mount_point, subvol);
-
-    if dry_run {
-        info(&format!(
-            "[dry-run] Would copy {} to {} with resumable progress",
-            source, target
-        ));
-        return Ok(());
-    }
-
-    // Check if target subvolume exists
-    if !Path::new(&target).exists() {
-        return Ok(()); // Subvolume doesn't exist, skip
-    }
-
-    // Check if source exists and has content
-    if !Path::new(source).exists() {
-        warn(&format!("  {} does not exist, skipping copy", source));
-        return Ok(());
-    }
-
-    let target_is_empty = fs::read_dir(&target)
-        .with_context(|| format!("Failed to inspect seed target {}", target))?
-        .next()
-        .is_none();
-    let tracked = progress
-        .seeds
-        .get(subvol)
-        .filter(|seed| seed.source == source && seed.target == target)
-        .cloned();
-    match (target_is_empty, tracked.as_ref().map(|seed| seed.status)) {
-        (false, Some(SeedStatus::Incomplete)) => {
-            info(&format!(
-                "  {} has an incomplete tracked seed, retrying",
-                subvol
-            ));
-        }
-        (false, _) => {
-            info(&format!(
-                "  {} already has untracked or completed content, skipping copy",
-                subvol
-            ));
-            return Ok(());
-        }
-        (true, Some(SeedStatus::Complete)) => {
-            info(&format!("  {} was already seeded, skipping copy", subvol));
-            return Ok(());
-        }
-        (true, Some(SeedStatus::Incomplete)) => {}
-        (true, None) => {
-            info(&format!(
-                "  {} is empty but has no tracked initialization seed, skipping copy",
-                subvol
-            ));
-            return Ok(());
-        }
-    }
-
-    info(&format!("Copying {} to {}...", source, subvol));
-    warn("This may take a while for large directories like /usr");
-
-    // Use rsync to preserve permissions, ACLs, and xattrs
-    let mut rsync_args = vec!["-aAX".to_string(), "--info=progress2".to_string()];
-    for path in excluded_paths {
-        rsync_args.push("--exclude".to_string());
-        rsync_args.push(format!("/{}/", path.trim_matches('/')));
-    }
-    rsync_args.push(format!("{}/", source));
-    rsync_args.push(format!("{}/", target));
-    let rsync_args: Vec<&str> = rsync_args.iter().map(String::as_str).collect();
-    run_init_command(runner, "rsync", &rsync_args, dry_run)?;
-
-    if let Some(seed) = progress.seeds.get_mut(subvol) {
-        seed.status = SeedStatus::Complete;
-    }
-    progress.save(mount_point)?;
-
-    success(&format!("  {} copied to {}", source, subvol));
     Ok(())
 }
 
@@ -874,7 +1067,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn init_dry_run_does_not_create_progress_for_existing_empty_targets() {
+    fn init_dry_run_does_not_execute_sync_commands() {
         let temp = tempdir().unwrap();
         let mount = temp.path().join("mount");
         let source = temp.path().join("source");
@@ -882,11 +1075,39 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         let config = test_config(&source, &temp.path().join("transfer-source"));
         let mut runner = FakeInitCommandRunner::default();
-        create_all_subvolumes_with_runner(&config, mount.to_str().unwrap(), true, &mut runner)
-            .unwrap();
-        assert!(!mount.join(INIT_PROGRESS_FILE).exists());
+        create_all_subvolumes_with_runner(
+            &config,
+            "/dev/test",
+            mount.to_str().unwrap(),
+            true,
+            true,
+            true,
+            &mut runner,
+        )
+        .unwrap();
         assert!(runner.calls.is_empty());
-        assert_eq!(fs::read_dir(&mount).unwrap().count(), 1);
+        assert!(mount.join("@home").exists());
+    }
+
+    #[test]
+    fn yes_requires_an_existing_config_file() {
+        let temp = tempdir().unwrap();
+        let missing = temp.path().join("missing.toml");
+        let existing = temp.path().join("existing.toml");
+        File::create(&existing).unwrap();
+
+        assert!(!allows_noninteractive_confirmation(
+            missing.to_str().unwrap(),
+            true
+        ));
+        assert!(allows_noninteractive_confirmation(
+            existing.to_str().unwrap(),
+            true
+        ));
+        assert!(!allows_noninteractive_confirmation(
+            existing.to_str().unwrap(),
+            false
+        ));
     }
 
     #[test]
@@ -913,7 +1134,6 @@ mod tests {
     struct FakeInitCommandRunner {
         subvolumes: HashSet<String>,
         calls: Vec<String>,
-        fail_rsync_once: bool,
     }
 
     impl InitCommandRunner for FakeInitCommandRunner {
@@ -934,10 +1154,6 @@ mod tests {
                     Ok(String::new())
                 }
                 ("rsync", args) if args.len() >= 4 => {
-                    if self.fail_rsync_once {
-                        self.fail_rsync_once = false;
-                        bail!("injected rsync failure")
-                    }
                     let source = args[args.len() - 2];
                     let target = args[args.len() - 1];
                     copy_tree(Path::new(source), Path::new(target))?;
@@ -992,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn initialization_seeds_nested_home_and_transfer_sources() {
+    fn first_init_skips_home_and_syncs_transfer_sources() {
         let temp = tempdir().unwrap();
         let source_home = temp.path().join("source-home");
         let source_local = source_home.join(".local");
@@ -1008,11 +1224,19 @@ mod tests {
         let config = test_config(&source_home, &source_transfer);
         let mut runner = FakeInitCommandRunner::default();
 
-        create_all_subvolumes_with_runner(&config, mount.to_str().unwrap(), false, &mut runner)
-            .unwrap();
+        create_all_subvolumes_with_runner(
+            &config,
+            "/dev/test",
+            mount.to_str().unwrap(),
+            true,
+            true,
+            false,
+            &mut runner,
+        )
+        .unwrap();
 
-        assert!(mount.join("@home/profile").exists());
-        assert!(mount.join("@home/.local/state").exists());
+        assert!(!mount.join("@home/profile").exists());
+        assert!(!mount.join("@home/.local/state").exists());
         assert!(mount.join("@transfer/container-layer").exists());
         assert!(source_home.join(".local/state").exists());
         assert!(source_transfer.join("container-layer").exists());
@@ -1034,11 +1258,111 @@ mod tests {
         assert!(runner
             .calls
             .iter()
-            .any(|call| call.contains("rsync") && call.contains("--exclude /.local/")));
+            .all(|call| !call.starts_with("rsync ") || !call.contains("@home")));
     }
 
     #[test]
-    fn preexisting_nested_home_subvolume_is_seeded_from_its_source() {
+    fn existing_config_syncs_empty_backup_and_nonempty_snapshot_only() {
+        let temp = tempdir().unwrap();
+        let mount = temp.path().join("mount");
+        let backup_source = temp.path().join("backup-source");
+        let empty_source = temp.path().join("empty-source");
+        let snapshot_source = temp.path().join("snapshot-source");
+        fs::create_dir_all(&mount).unwrap();
+        fs::create_dir_all(&backup_source).unwrap();
+        fs::create_dir_all(&empty_source).unwrap();
+        fs::create_dir_all(&snapshot_source).unwrap();
+        touch(backup_source.join("new-file"));
+        touch(empty_source.join("empty-target-file"));
+        touch(snapshot_source.join("current-file"));
+        fs::create_dir_all(mount.join("@data")).unwrap();
+        fs::create_dir_all(mount.join("@empty")).unwrap();
+        fs::create_dir_all(mount.join("@etc")).unwrap();
+        touch(mount.join("@data/existing-file"));
+        touch(mount.join("@etc/old-file"));
+
+        let mut config = Config::for_distribution(crate::config::Distribution::Arch);
+        config.subvolumes.backup.clear();
+        config.subvolumes.backup.insert(
+            "@data".to_string(),
+            BackupSubvol::Simple(backup_source.display().to_string()),
+        );
+        config.subvolumes.backup.insert(
+            "@empty".to_string(),
+            BackupSubvol::Simple(empty_source.display().to_string()),
+        );
+        config.subvolumes.exclude.paths.clear();
+        config.subvolumes.snapshot_only.clear();
+        config.subvolumes.snapshot_only.insert(
+            "@etc".to_string(),
+            crate::config::SnapshotSubvol {
+                snapshot_name: "etc".to_string(),
+                source: snapshot_source.display().to_string(),
+            },
+        );
+        config.subvolumes.transfer.clear();
+
+        let plan = build_sync_plan(&config, mount.to_str().unwrap(), false, false).unwrap();
+        let data = plan.iter().find(|entry| entry.subvol == "@data").unwrap();
+        let empty = plan.iter().find(|entry| entry.subvol == "@empty").unwrap();
+        let snapshot = plan.iter().find(|entry| entry.subvol == "@etc").unwrap();
+
+        assert!(!data.copy);
+        assert_eq!(data.state, TargetState::NonEmpty);
+        assert!(empty.copy);
+        assert_eq!(empty.state, TargetState::Empty);
+        assert!(snapshot.copy);
+        assert_eq!(snapshot.state, TargetState::NonEmpty);
+    }
+
+    #[test]
+    fn existing_config_ignores_nested_subvolume_when_checking_parent() {
+        let temp = tempdir().unwrap();
+        let mount = temp.path().join("mount");
+        let source_home = temp.path().join("source-home");
+        fs::create_dir_all(source_home.join(".local")).unwrap();
+        fs::create_dir_all(mount.join("@home/.local")).unwrap();
+        touch(source_home.join("profile"));
+        touch(source_home.join(".local/state"));
+
+        let config = test_config(&source_home, &temp.path().join("unused-transfer"));
+        let plan = build_sync_plan(&config, mount.to_str().unwrap(), false, false).unwrap();
+        let parent = plan.iter().find(|entry| entry.subvol == "@home").unwrap();
+        let nested = plan
+            .iter()
+            .find(|entry| entry.subvol == "@home/.local")
+            .unwrap();
+
+        assert!(parent.copy);
+        assert_eq!(parent.state, TargetState::Empty);
+        assert!(nested.copy);
+        assert_eq!(nested.state, TargetState::Empty);
+    }
+
+    #[test]
+    fn resume_command_mounts_top_level_and_keeps_rsync_options() {
+        let entry = SyncPlanEntry {
+            subvol: "@data".to_string(),
+            source: "/source/with space".to_string(),
+            target: "/mnt/btrfs-setup/@data".to_string(),
+            kind: SyncKind::Backup,
+            excluded_paths: vec![".cache".to_string()],
+            state: TargetState::Empty,
+            copy: true,
+            reason: None,
+        };
+
+        let command = render_resume_command("/dev/path with space", &[entry]).unwrap();
+
+        assert!(command.contains("sudo mount -o subvolid=5 '/dev/path with space'"));
+        assert!(command.contains("'sudo' 'rsync' '-aAX' '--partial' '--info=progress2'"));
+        assert!(command.contains("'--exclude' '/.cache/'"));
+        assert!(command.contains("'/source/with space/' \"$resume_root\"/'@data/'"));
+        assert!(command.contains("trap cleanup EXIT"));
+    }
+
+    #[test]
+    fn preexisting_nested_home_subvolume_is_synced_from_its_source() {
         let temp = tempdir().unwrap();
         let source_home = temp.path().join("source-home");
         let source_local = source_home.join(".local");
@@ -1058,40 +1382,19 @@ mod tests {
             .subvolumes
             .insert(target_local.to_string_lossy().into_owned());
 
-        create_all_subvolumes_with_runner(&config, mount.to_str().unwrap(), false, &mut runner)
-            .unwrap();
-
-        assert!(target_local.join("state").exists());
-        assert!(source_local.join("state").exists());
-    }
-
-    #[test]
-    fn existing_populated_target_without_progress_is_skipped_safely() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
-        let target = temp.path().join("mount/@data");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        touch(source.join("new-file"));
-        touch(target.join("existing-file"));
-
-        let mount = temp.path().join("mount");
-        let mut progress = InitProgress::default();
-        let mut runner = FakeInitCommandRunner::default();
-
-        seed_subvolume(
+        create_all_subvolumes_with_runner(
+            &config,
+            "/dev/test",
             mount.to_str().unwrap(),
-            "@data",
-            source.to_str().unwrap(),
             false,
-            &mut progress,
+            true,
+            false,
             &mut runner,
         )
         .unwrap();
 
-        assert!(target.join("existing-file").exists());
-        assert!(!target.join("new-file").exists());
-        assert!(runner.calls.iter().all(|call| !call.starts_with("rsync ")));
+        assert!(target_local.join("state").exists());
+        assert!(source_local.join("state").exists());
     }
 
     #[test]
@@ -1117,103 +1420,6 @@ mod tests {
             .calls
             .iter()
             .all(|call| !call.starts_with("btrfs subvolume create")));
-    }
-
-    #[test]
-    fn failed_seed_is_recorded_incomplete_and_retries() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
-        let mount = temp.path().join("mount");
-        let target = mount.join("@data");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        touch(source.join("data"));
-
-        let mut progress = InitProgress::default();
-        prepare_seed(
-            mount.to_str().unwrap(),
-            "@data",
-            source.to_str().unwrap(),
-            &mut progress,
-        )
-        .unwrap();
-        let mut failing_runner = FakeInitCommandRunner {
-            fail_rsync_once: true,
-            ..Default::default()
-        };
-
-        assert!(seed_subvolume(
-            mount.to_str().unwrap(),
-            "@data",
-            source.to_str().unwrap(),
-            false,
-            &mut progress,
-            &mut failing_runner,
-        )
-        .is_err());
-        assert_eq!(
-            InitProgress::load(mount.to_str().unwrap())
-                .unwrap()
-                .seeds
-                .get("@data")
-                .unwrap()
-                .status,
-            SeedStatus::Incomplete
-        );
-
-        let mut retry_runner = FakeInitCommandRunner::default();
-        seed_subvolume(
-            mount.to_str().unwrap(),
-            "@data",
-            source.to_str().unwrap(),
-            false,
-            &mut progress,
-            &mut retry_runner,
-        )
-        .unwrap();
-        assert!(target.join("data").exists());
-        assert_eq!(
-            progress.seeds.get("@data").unwrap().status,
-            SeedStatus::Complete
-        );
-    }
-
-    #[test]
-    fn ablation_old_empty_guard_misses_nested_home_data() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("source");
-        let mount = temp.path().join("mount");
-        let target = mount.join("@home");
-        let nested_target = target.join(".local");
-        fs::create_dir_all(source.join(".local")).unwrap();
-        fs::create_dir_all(&nested_target).unwrap();
-        touch(source.join(".local/state"));
-
-        // The old implementation treated the parent as non-empty after
-        // creating nested paths and skipped the seed entirely.
-        let old_would_copy = fs::read_dir(&target).unwrap().next().is_none();
-        assert!(!old_would_copy);
-        assert!(!target.join(".local/state").exists());
-
-        let mut progress = InitProgress::default();
-        prepare_seed(
-            mount.to_str().unwrap(),
-            "@home/.local",
-            source.join(".local").to_str().unwrap(),
-            &mut progress,
-        )
-        .unwrap();
-        let mut runner = FakeInitCommandRunner::default();
-        seed_subvolume(
-            mount.to_str().unwrap(),
-            "@home/.local",
-            source.join(".local").to_str().unwrap(),
-            false,
-            &mut progress,
-            &mut runner,
-        )
-        .unwrap();
-        assert!(nested_target.join("state").exists());
     }
 
     #[test]

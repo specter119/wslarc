@@ -24,7 +24,7 @@ fn distribution_templates_share_common_rules() {
         sorted_keys(&arch.subvolumes.snapshot_only),
         sorted_keys(&debian.subvolumes.snapshot_only)
     );
-    for name in ["@home", "@usr", "@opt"] {
+    for name in ["@home", "@usr", "@opt", "@nix"] {
         assert!(arch.subvolumes.backup.contains_key(name));
         assert!(debian.subvolumes.backup.contains_key(name));
     }

@@ -1,8 +1,11 @@
 use anyhow::{bail, Context, Result};
 use console::style;
 use log::{debug, trace};
-use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 
 pub fn run(cmd: &str, args: &[&str]) -> Result<String> {
@@ -29,29 +32,68 @@ pub fn run(cmd: &str, args: &[&str]) -> Result<String> {
 }
 
 pub fn run_with_output(cmd: &str, args: &[&str]) -> Result<()> {
+    run_with_output_inner(cmd, args, false)
+}
+
+pub fn run_with_output_interruptible(cmd: &str, args: &[&str]) -> Result<()> {
+    #[cfg(unix)]
+    install_ctrl_c_handler()?;
+    run_with_output_inner(cmd, args, true)
+}
+
+fn run_with_output_inner(cmd: &str, args: &[&str], reset_ctrl_c: bool) -> Result<()> {
     debug!("Executing (streaming): {} {}", cmd, args.join(" "));
 
-    let mut child = Command::new(cmd)
+    let mut command = Command::new(cmd);
+    command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    if reset_ctrl_c {
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = command
         .spawn()
         .with_context(|| format!("Failed to spawn: {} {}", cmd, args.join(" ")))?;
 
     let stdout_handle = child.stdout.take().map(|stdout| {
         thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                println!("  {}", line);
+            let mut reader = stdout;
+            let mut buffer = [0u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        let mut output = std::io::stdout().lock();
+                        let _ = output.write_all(&buffer[..count]);
+                        let _ = output.flush();
+                    }
+                }
             }
         })
     });
 
     let stderr_handle = child.stderr.take().map(|stderr| {
         thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                eprintln!("  {}", line);
+            let mut reader = stderr;
+            let mut buffer = [0u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        let mut output = std::io::stderr().lock();
+                        let _ = output.write_all(&buffer[..count]);
+                        let _ = output.flush();
+                    }
+                }
             }
         })
     });
@@ -68,6 +110,17 @@ pub fn run_with_output(cmd: &str, args: &[&str]) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn install_ctrl_c_handler() -> Result<()> {
+    static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
+
+    INSTALLED
+        .get_or_init(|| ctrlc::set_handler(|| {}).map_err(|error| error.to_string()))
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("Failed to install Ctrl-C handler: {error}"))
 }
 
 pub fn run_or_dry(cmd: &str, args: &[&str], dry_run: bool) -> Result<String> {
