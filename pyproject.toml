@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wslarc"
+version = "0.1.0"
+description = "WSL2 Btrfs backup and restore tool"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "tomli-w>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.13",
+    "nuitka>=2.6",
+    "pytest>=8",
+    "ruff>=0.8",
+]
+
+[project.scripts]
+wslarc = "wslarc.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/wslarc"]

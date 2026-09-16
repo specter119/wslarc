@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Local tooling
+.mcp.json
+
+# Build outputs
+/target/
+/build-binary/
