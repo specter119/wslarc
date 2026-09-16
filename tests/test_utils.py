@@ -17,10 +17,9 @@ def test_findmnt_parser_flattens_children() -> None:
 
 
 def test_package_parsers_match_rust_behavior() -> None:
-    assert (
-        parse_pacman_package_info("Name : systemd\nVersion : 256.5-1\nArchitecture : any\n").version
-        == "256.5-1"
-    )
+    package = parse_pacman_package_info("Name : systemd\nVersion : 256.5-1\nArchitecture : any\n")
+    assert package is not None
+    assert package.version == "256.5-1"
     assert parse_pacman_depends("Depends On : glibc libcap>=2.0 sh\n") == [
         "glibc",
         "libcap",

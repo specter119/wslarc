@@ -60,7 +60,6 @@ def _update_wsl_conf(config_path: str, runner: CommandRunner) -> None:
         info(f"[dry-run] Would update {WSL_CONF} with [boot] command")
         return
     parser = configparser.ConfigParser(interpolation=None, delimiters=("="))
-    parser.optionxform = str  # type: ignore[assignment, method-assign]
     if WSL_CONF.exists():
         parser.read(WSL_CONF)
     if not parser.has_section("boot"):
