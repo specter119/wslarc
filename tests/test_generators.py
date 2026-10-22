@@ -1,3 +1,4 @@
+from wslarc.commands.mount import systemctl_commands
 from wslarc.config import Config, Distribution
 from wslarc.generators import btrbk, hooks, invocation, systemd
 
@@ -12,6 +13,13 @@ def test_systemd_and_btrbk_generators() -> None:
     assert "ExecStart=/usr/local/bin/wslarc" in btrbk.generate_service(
         config, "/etc/wslarc/config.toml"
     )
+
+
+def test_mount_enables_ext4_sync_unit_only_when_needed() -> None:
+    config = Config.for_distribution(Distribution.ARCH)
+    unit = hooks.ext4_mount_unit_filename(config)
+    assert ["systemctl", "enable", "--now", unit] in systemctl_commands(config, True)
+    assert not any(unit in command for command in systemctl_commands(config, False))
 
 
 def test_hook_and_argument_quoting() -> None:

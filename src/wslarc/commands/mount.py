@@ -125,6 +125,26 @@ def _install_binary(config: Config, runner: CommandRunner) -> None:
     success("wslarc binary installed")
 
 
+def systemctl_commands(config: Config, needs_ext4: bool) -> list[list[str]]:
+    commands = [
+        ["systemctl", "daemon-reload"],
+        ["systemctl", "enable", systemd.mount_unit_filename(config.mount.base)],
+    ]
+    commands.extend(
+        ["systemctl", "enable", systemd.mount_unit_filename(item.mount)]
+        for item in config.subvolumes.backup.values()
+    )
+    commands.extend(
+        ["systemctl", "enable", systemd.mount_unit_filename(item.mount)]
+        for item in config.subvolumes.transfer.values()
+    )
+    if needs_ext4:
+        # The package hooks rsync into this mount, so it must be active now, not only after reboot.
+        commands.append(["systemctl", "enable", "--now", hooks.ext4_mount_unit_filename(config)])
+    commands.append(["systemctl", "enable", "btrbk.timer"])
+    return commands
+
+
 def run(
     config: Config,
     distribution: Distribution,
@@ -162,23 +182,6 @@ def run(
     _write(SYSTEMD_DIR / "btrbk.timer", btrbk.generate_timer(config.btrbk.timer_schedule), runner)
     if needs_ext4:
         _setup_ext4_sync(config, distribution, config_path, runner)
-    commands = [
-        ["systemctl", "daemon-reload"],
-        ["systemctl", "enable", systemd.mount_unit_filename(config.mount.base)],
-    ]
-    commands.extend(
-        ["systemctl", "enable", systemd.mount_unit_filename(item.mount)]
-        for item in config.subvolumes.backup.values()
-    )
-    commands.extend(
-        ["systemctl", "enable", systemd.mount_unit_filename(item.mount)]
-        for item in config.subvolumes.transfer.values()
-    )
-    commands.extend(
-        [
-            ["systemctl", "enable", "btrbk.timer"],
-        ]
-    )
-    for command in commands:
+    for command in systemctl_commands(config, needs_ext4):
         runner.run(command[0], command[1:])
     success("Mount setup complete")
