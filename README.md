@@ -47,9 +47,9 @@ above.
 Create a VHDX from an elevated Windows PowerShell:
 
 ```powershell
-$vhdxPath = "$env:USERPROFILE\.local\share\wsl\btrfs.vhdx"
+$vhdxPath = "$env:USERPROFILE\.local\share\wslarc\btrfs.vhdx"
 New-Item -ItemType Directory -Force -Path (Split-Path $vhdxPath)
-New-VHD -Path $vhdxPath -SizeBytes 150GB -Dynamic
+New-VHD -Path $vhdxPath -SizeBytes 512GB -Dynamic
 ```
 
 Then initialize from WSL:
@@ -57,6 +57,10 @@ Then initialize from WSL:
 ```bash
 sudo wslarc init
 ```
+
+During first initialization, the suggested VHDX path is
+`%USERPROFILE%\.local\share\wslarc\btrfs.vhdx`, resolved through `cmd.exe`
+interop. If the profile cannot be resolved, no default is suggested.
 
 The default configuration path is `/etc/wslarc/config.toml`. Use
 `--config PATH` to select another path.

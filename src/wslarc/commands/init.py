@@ -28,6 +28,7 @@ from wslarc.utils.prompt import (
     warn,
 )
 from wslarc.utils.shell import CommandRunner
+from wslarc.utils.windows import default_vhdx_path
 
 
 class SyncKind(StrEnum):
@@ -75,7 +76,9 @@ def _collect_config(config: Config, distribution: Distribution) -> Config:
     section("User Configuration")
     result.set_user_unexpanded(input_default("Target Linux username", result.user.name))
     section("VHDX Configuration")
-    result.vhdx.path = input_default("VHDX path (Windows, full path)", result.vhdx.path)
+    result.vhdx.path = input_default(
+        "VHDX path (Windows, full path)", result.vhdx.path or default_vhdx_path()
+    )
     result.vhdx.label = input_default("Btrfs label", result.vhdx.label)
     section("Mount Configuration")
     result.mount.base = input_default("Mount base", result.mount.base)
