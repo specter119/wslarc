@@ -44,13 +44,18 @@ above.
 
 ## Quick start
 
-Create a VHDX from an elevated Windows PowerShell:
+Create a VHDX from an elevated Windows PowerShell. This uses `diskpart`, so it
+does not require the Hyper-V PowerShell module:
 
 ```powershell
 $vhdxPath = "$env:USERPROFILE\.local\share\wslarc\btrfs.vhdx"
 New-Item -ItemType Directory -Force -Path (Split-Path $vhdxPath)
-New-VHD -Path $vhdxPath -SizeBytes 512GB -Dynamic
+"create vdisk file=`"$vhdxPath`" maximum=524288 type=expandable" | diskpart
 ```
+
+`maximum` is in MB (524288 MB = 512 GB) and `type=expandable` creates a
+dynamically growing disk. Do not initialize or format the disk in Windows;
+`wslarc init` attaches it to WSL and formats it as Btrfs.
 
 Then initialize from WSL:
 
