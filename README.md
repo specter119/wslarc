@@ -40,6 +40,10 @@ For a single-file Linux binary:
 ./scripts/build-binary.sh
 ```
 
+The script runs the build through the `build` dependency group
+(`uv run --group build`), so uv installs `nuitka[onefile]` (with zstandard
+compression) and `patchelf` on demand. No system-level `patchelf` is
+required; `ccache` is optional and only speeds up repeated compilations.
 The resulting binary contains the Python runtime. It still invokes the
 external Btrfs, rsync, btrbk, systemd, package-manager, and WSL tools listed
 above.

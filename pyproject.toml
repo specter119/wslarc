@@ -15,7 +15,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "mypy>=1.13",
-    "nuitka>=2.6",
     "pytest>=8",
     "ruff>=0.8",
 ]
@@ -40,3 +39,9 @@ select = ["E", "F", "I", "B", "UP"]
 python_version = "3.11"
 strict = true
 files = ["src/wslarc"]
+
+[dependency-groups]
+build = [
+    "nuitka[onefile]>=2.6",
+    "patchelf>=0.17",
+]
