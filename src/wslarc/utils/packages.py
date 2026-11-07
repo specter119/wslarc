@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+from pathlib import Path
 
 from wslarc.utils.block import (
     PacmanPackage,
+    pacman_install_args,
+    pacman_sysroot_chroots,
     parse_debian_depends,
     parse_debian_status_version,
     parse_pacman_depends,
     parse_pacman_package_info,
     parse_pacman_query_version,
 )
+from wslarc.utils.shell import CommandError, run
 
 PACMAN_SYNC_GUARD_ENV = "WSLARC_SYSTEMD_SYNC_IN_PROGRESS"
 
@@ -21,10 +26,44 @@ def pacman_query_version(package: str) -> str | None:
     return parse_pacman_query_version(result.stdout) if result.returncode == 0 else None
 
 
-def pacman_query_package(package: str, root: str | None = None) -> PacmanPackage | None:
-    args = ["-Qi", package] if root is None else ["--sysroot", root, "-Qi", package]
-    result = subprocess.run(["pacman", *args], capture_output=True, text=True, check=False)
+def pacman_query_package(package: str) -> PacmanPackage | None:
+    result = subprocess.run(["pacman", "-Qi", package], capture_output=True, text=True, check=False)
     return parse_pacman_package_info(result.stdout) if result.returncode == 0 else None
+
+
+def pacman_query_package_in_root(root: str, package: str) -> PacmanPackage | None:
+    result = subprocess.run(
+        ["pacman", "--sysroot", root, "-Qi", package],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return parse_pacman_package_info(result.stdout) if result.returncode == 0 else None
+
+
+def pacman_query_archive_package(path: str | Path) -> PacmanPackage | None:
+    result = subprocess.run(
+        ["pacman", "-Qip", str(path)], capture_output=True, text=True, check=False
+    )
+    return parse_pacman_package_info(result.stdout) if result.returncode == 0 else None
+
+
+def pacman_install_archives(root: str, archives: list[str]) -> None:
+    if not archives:
+        return
+    version = run("pacman", ["--version"])
+    args = pacman_install_args(root, archives, pacman_sysroot_chroots(version))
+    result = subprocess.run(
+        ["pacman", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, PACMAN_SYNC_GUARD_ENV: "1"},
+    )
+    if result.returncode:
+        raise CommandError(
+            f"Command failed: pacman --sysroot {root} -U\n{result.stderr.strip()}"
+        )
 
 
 def pacman_query_depends(package: str) -> list[str]:

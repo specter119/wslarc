@@ -161,6 +161,26 @@ class BtrbkConfig:
 @dataclass
 class Ext4SyncConfig:
     mount_point: str = "/mnt/ext4-root"
+    extra_packages: list[str] = field(default_factory=list)
+
+def parse_extra_packages(raw: dict[str, Any]) -> list[str]:
+    unknown = set(raw) - {"mount_point", "extra_packages"}
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ConfigError(f"unknown ext4_sync field(s): {names}")
+
+    values = raw.get("extra_packages", [])
+    if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+        raise ConfigError("ext4_sync.extra_packages must be a list of package names")
+
+    packages: list[str] = []
+    for item in values:
+        name = item.strip()
+        if not name:
+            raise ConfigError("ext4_sync.extra_packages must not contain empty package names")
+        if name not in packages:
+            packages.append(name)
+    return packages
 
 
 @dataclass
@@ -265,13 +285,18 @@ class Config:
             str(btrbk_raw.get("timer_schedule", "*-*-* 03:00:00")),
         )
         ext4_raw = raw.get("ext4_sync", {})
+        if not isinstance(ext4_raw, dict):
+            raise ConfigError("ext4_sync must be a table")
         return cls(
             vhdx=vhdx,
             user=user,
             mount=mount,
             subvolumes=SubvolumesConfig(backup, exclude, transfer, snapshot_only),
             btrbk=btrbk,
-            ext4_sync=Ext4SyncConfig(str(ext4_raw.get("mount_point", "/mnt/ext4-root"))),
+            ext4_sync=Ext4SyncConfig(
+                str(ext4_raw.get("mount_point", "/mnt/ext4-root")),
+                parse_extra_packages(ext4_raw),
+            ),
             uuid=raw.get("uuid"),
         )
 
@@ -306,7 +331,10 @@ class Config:
                 "preserve": self.btrbk.preserve,
                 "timer_schedule": self.btrbk.timer_schedule,
             },
-            "ext4_sync": {"mount_point": self.ext4_sync.mount_point},
+            "ext4_sync": {
+                "mount_point": self.ext4_sync.mount_point,
+                "extra_packages": list(self.ext4_sync.extra_packages),
+            },
         }
         if self.uuid is not None:
             result["uuid"] = self.uuid

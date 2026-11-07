@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from wslarc.config import Config, Distribution
 from wslarc.generators.systemd import path_to_unit_name
@@ -16,6 +16,7 @@ from wslarc.utils.packages import (
 
 SYSTEMD_PACKAGES = ("systemd", "systemd-libs", "systemd-sysvcompat")
 DEBIAN_SYSTEMD_PACKAGES = ("systemd", "systemd-sysv", "libsystemd0")
+BTRFS_PACKAGES = ("btrfs-progs",)
 PACMAN_HOOK_PATH = "/etc/pacman.d/hooks/sync-systemd-ext4.hook"
 APT_HOOK_PATH = "/etc/apt/apt.conf.d/99wslarc-sync-systemd"
 ARCH_PENDING_PACKAGES = "/run/wslarc/arch-pending-packages"
@@ -77,18 +78,26 @@ def collect_recursive_targets(
     return sorted(seen) if installed_roots else []
 
 
-def collect_hook_targets(distribution: Distribution) -> list[str]:
+def collect_hook_targets(
+    distribution: Distribution, extra_packages: Sequence[str] = ()
+) -> list[str]:
     if distribution is Distribution.ARCH:
+        roots = _unique_roots(SYSTEMD_PACKAGES + BTRFS_PACKAGES + tuple(extra_packages))
         return collect_recursive_targets(
-            SYSTEMD_PACKAGES,
+            roots,
             pacman_query_depends,
             lambda package: pacman_query_version(package) is not None,
         )
+    roots = _unique_roots(DEBIAN_SYSTEMD_PACKAGES + BTRFS_PACKAGES + tuple(extra_packages))
     return collect_recursive_targets(
-        DEBIAN_SYSTEMD_PACKAGES,
+        roots,
         debian_query_depends,
         lambda package: debian_query_version(package) is not None,
     )
+
+
+def _unique_roots(roots: Sequence[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(roots))
 
 
 def generate_ext4_mount(config: Config, uuid: str) -> str:

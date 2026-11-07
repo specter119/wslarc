@@ -18,6 +18,8 @@ The system operations still require these external tools:
 - `wslarc snapshot *`: `btrbk`
 - `wslarc restore`: `btrfs-progs`, and conditional `rsync`
 - `wslarc attach`: WSL Windows interop and `wsl.exe`
+- `wslarc hook-sync-systemd`: `pacman` on Arch; `dpkg-query`, `dpkg-deb`,
+  `rsync`, and `ldconfig` on Debian/Ubuntu
 
 The command checks dependencies at the point where each operation needs them.
 It does not perform a blanket preflight for unrelated commands.
@@ -123,6 +125,47 @@ There is no `seed` field. A configuration such as this is sufficient:
 ```
 
 Unknown backup fields, including the old `seed` field, are rejected.
+
+## systemd ext4 sync hook
+
+`wslarc mount` installs a package hook (`/etc/pacman.d/hooks/` on Arch,
+`/etc/apt/apt.conf.d/` on Debian/Ubuntu) that runs
+`wslarc hook-sync-systemd` after package transactions. The hook keeps the
+hidden ext4 root bootable: it only synchronizes the recursive dependency
+closure of the systemd package set plus `btrfs-progs`, so the ext4 root can
+boot and mount its Btrfs volumes. Unrelated package installations never
+trigger a copy. When `btrfs-progs` is not installed on the host, it is
+skipped automatically.
+
+Additional root packages can be added to the closure with the
+`[ext4_sync]` table. The systemd and `btrfs-progs` roots are always kept, so
+configuring extras cannot remove the boot requirement:
+
+```toml
+[ext4_sync]
+mount_point = "/mnt/ext4-root"
+extra_packages = ["btrbk", "rsync"]
+```
+
+Each entry names a host package whose files (and those of its installed
+dependencies) are mirrored into the ext4 root. Entries that are not
+installed are skipped. Changes affect the generated pacman hook targets, so
+re-run `sudo wslarc mount` after editing this table.
+
+On Debian/Ubuntu, the APT pre-invoke step records the package names of the
+`.deb` files being installed. The post-invoke step then synchronizes the
+files owned by the closure package by package with
+`rsync -aAX --relative`, prunes synced files that are no longer owned by any
+installed package according to the `.wslarc-systemd-sync-manifest` manifest
+stored on the ext4 root, and rebuilds the ext4 linker cache with
+`ldconfig -r <mount point>`.
+
+On Arch, the hook queries the installed package metadata, skips packages
+whose name, version, and architecture already match inside the ext4 root,
+copies the matching archives from `/var/cache/pacman/pkg` into the ext4
+root, and installs them with `pacman --sysroot <root> -U --noconfirm`. A
+guard environment variable prevents the nested pacman hook from recursing
+into another sync.
 
 ## Development checks
 

@@ -101,7 +101,7 @@ def _setup_ext4_sync(
         hooks.generate_ext4_mount(config, uuid),
         runner,
     )
-    targets = hooks.collect_hook_targets(distribution)
+    targets = hooks.collect_hook_targets(distribution, config.ext4_sync.extra_packages)
     hook_path, content = hooks.generate_package_hook(distribution, targets)
     content = content.replace(
         "/usr/local/bin/wslarc",
