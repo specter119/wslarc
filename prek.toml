@@ -2,6 +2,11 @@
 # Hook repositories are pinned to immutable tags; bump them together with uv.lock.
 minimum_prek_version = "0.5.0"
 
+# uv.lock points at public PyPI. Without this, a machine whose uv default index
+# is a private mirror reports the lock as out of date in the uv-lock hook.
+# `uv check` starts its own uv subprocess, so a flag would not reach it.
+default_env = { UV_DEFAULT_INDEX = "https://pypi.org/simple" }
+
 [[repos]]
 repo = "builtin"
 
@@ -37,7 +42,7 @@ id = "detect-private-key"
 # Keep rev in step with ruff in uv.lock.
 [[repos]]
 repo = "https://github.com/astral-sh/ruff-pre-commit"
-rev = "v0.16.7"
+rev = "v0.17.4"
 
 [[repos.hooks]]
 id = "ruff-check"
@@ -58,7 +63,7 @@ args = ["--check"]
 
 [[repos]]
 repo = "https://github.com/abravalheri/validate-pyproject"
-rev = "0.26"
+rev = "v0.27"
 
 [[repos.hooks]]
 id = "validate-pyproject"
@@ -70,7 +75,17 @@ rev = "v8.30.1"
 [[repos.hooks]]
 id = "gitleaks"
 
-# mypy type-checks the whole `files` set from pyproject.toml, so filenames are not
+# ty is the fast checker and runs on pre-commit; keep its rev in step with ty in
+# uv.lock. It reads its file set from pyproject.toml, so no filenames are passed.
+[[repos]]
+repo = "https://github.com/astral-sh/ty-pre-commit"
+rev = "v0.0.100"
+
+[[repos.hooks]]
+id = "ty"
+
+# mypy stays the strict gate the repository documents: it checks the whole `files`
+# set from pyproject.toml from pyproject.toml, so filenames are not
 # passed through: a change in one module can break a caller in another.
 [[repos]]
 repo = "local"

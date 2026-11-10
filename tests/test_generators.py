@@ -5,7 +5,7 @@ import pytest
 
 from wslarc.commands import mount, status
 from wslarc.commands.mount import systemctl_commands
-from wslarc.config import Config, Distribution
+from wslarc.config import Config, Distribution, TransferSubvol
 from wslarc.generators import btrbk, hooks, invocation, systemd
 from wslarc.utils.block import MountInfo
 from wslarc.utils.shell import CommandError, CommandRunner
@@ -462,7 +462,5 @@ def test_usr_subvolume_is_recognised_in_the_transfer_table(tmp_path: Path) -> No
     config.user.name = "alice"
     config.expand_variables()
     del config.subvolumes.backup["@usr"]
-    config.subvolumes.transfer["@usr"] = config.subvolumes.backup["@home"].__class__(
-        mount="/usr", options="compress=zstd"
-    )
+    config.subvolumes.transfer["@usr"] = TransferSubvol(mount="/usr", options="compress=zstd")
     assert mount.usr_subvol_name(config) == "@usr"

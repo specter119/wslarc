@@ -267,10 +267,15 @@ not available.
 ## Development checks
 
 ```bash
+uv sync                   # installs the dev group: ruff, ty, mypy, pytest
+prek run --all-files      # every hook below, plus the hygiene and secret scans
 pytest
 ruff check src tests
+ty check
 mypy
 ```
+
+`prek install` installs the hooks; `pytest` and `mypy` also run on every push.
 
 Tests use fake command runners and temporary directories. They do not attach
 VHDX files, format filesystems, mount subvolumes, run real rsync, or change

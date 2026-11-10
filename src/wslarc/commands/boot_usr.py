@@ -12,7 +12,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -46,7 +46,7 @@ STARTABLE_SUFFIXES = (".service", ".socket", ".timer", ".path", ".target")
 
 
 @contextmanager
-def _transaction_lock(path: Path | None = None) -> Iterator[None]:
+def _transaction_lock(path: Path | None = None) -> Generator[None, None, None]:
     """Serialize pre and post across processes.
 
     Both steps read the same records file and mount table, so a second process that

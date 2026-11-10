@@ -12,18 +12,15 @@ dependencies = [
     "tomli-w>=1.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "mypy>=1.13",
-    "pytest>=8",
-    "ruff>=0.8",
-]
-
 [project.scripts]
 wslarc = "wslarc.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -44,4 +41,12 @@ files = ["src/wslarc"]
 build = [
     "nuitka[onefile]>=2.6",
     "patchelf>=0.17",
+]
+# Installed by `uv sync` without flags: the tools the README's development
+# checks and the prek hooks run.
+dev = [
+    "mypy>=1.13",
+    "pytest>=8",
+    "ruff>=0.8",
+    "ty>=0.0.100",
 ]

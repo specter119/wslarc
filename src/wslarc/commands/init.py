@@ -6,7 +6,7 @@ import contextlib
 import shlex
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -400,7 +400,7 @@ def render_resume_command(device: str, pending: list[SyncPlanEntry]) -> str | No
 @contextlib.contextmanager
 def _source_view(
     source: str, runner: CommandRunner, view_root: Path = Path("/run/wslarc")
-) -> Iterator[str]:
+) -> Generator[str, None, None]:
     """Yield a read-only, non-recursive bind view of ``source`` for rsync to read.
 
     The view hides every mount below the source (WSL drivers, GPU libraries, kernel
