@@ -8,21 +8,27 @@ from pathlib import Path
 
 from wslarc.config import Config, Distribution
 from wslarc.generators import btrbk, hooks, invocation, systemd
-from wslarc.utils.block import Dependency, ensure_dependencies_for
-from wslarc.utils.prompt import confirm_or_yes, info, success
+from wslarc.utils.block import Dependency, ensure_dependencies_for, find_mount, is_mountpoint
+from wslarc.utils.prompt import confirm_or_yes, info, success, warn
 from wslarc.utils.shell import CommandRunner
-from wslarc.utils.storage import install_copies
+from wslarc.utils.storage import install_copies, verify_mount
 
-SYSTEMD_DIR = Path("/etc/systemd/system")
+SYSTEMD_DIR = systemd.UNIT_DIR
 BTRBK_CONF = Path("/etc/btrbk/btrbk.conf")
 WSL_CONF = Path("/etc/wsl.conf")
 
 
 def usr_subvol_name(config: Config) -> str | None:
-    return next(
-        (name for name, subvol in config.subvolumes.backup.items() if subvol.mount == "/usr"),
-        None,
-    )
+    """The subvolume mounted at /usr, backup or transfer.
+
+    Both kinds are written as a mount unit, so only asking the backup table would let
+    `_remove_boot_units` delete the unit that `_generate_units` just wrote.
+    """
+    for table in (config.subvolumes.backup, config.subvolumes.transfer):
+        for name, subvol in table.items():
+            if subvol.mount == "/usr":
+                return name
+    return None
 
 
 def validate_automation_config_path(config: Config, config_path: str) -> None:
@@ -90,6 +96,79 @@ def _generate_units(config: Config, runner: CommandRunner) -> None:
         )
 
 
+def _wslarc_usr_mount_unit(config: Config) -> Path | None:
+    """The `usr.mount` unit wslarc generated, if it is still on disk.
+
+    Ownership is the `[Mount]` table itself: `What=UUID=<configured uuid>` and
+    `Where=/usr` must match exactly. Another disk mounted at /usr, or a unit that only
+    mentions the UUID in a comment, is left alone, and without a known UUID nothing can be
+    attributed to wslarc.
+    """
+    if config.uuid is None:
+        return None
+    unit = SYSTEMD_DIR / systemd.mount_unit_filename("/usr")
+    if not unit.is_file():
+        return None
+    try:
+        text = unit.read_text()
+    except OSError:
+        return None
+    parser = configparser.ConfigParser(interpolation=None, delimiters=("=",))
+    try:
+        parser.read_string(text)
+    except configparser.Error:
+        return None
+    if not parser.has_section("Mount"):
+        return None
+    if parser.get("Mount", "What", fallback="") != f"UUID={config.uuid}":
+        return None
+    if parser.get("Mount", "Where", fallback="") != "/usr":
+        return None
+    return unit
+
+
+def _remove_boot_units(config: Config, runner: CommandRunner) -> None:
+    """Disable and delete boot units left over from a configuration that had /usr."""
+    usr_unit = _wslarc_usr_mount_unit(config)
+    leftover = [
+        unit
+        for unit in (systemd.USR_PRE_UNIT, systemd.USR_POST_UNIT)
+        if (SYSTEMD_DIR / unit).exists()
+    ]
+    if usr_unit is not None:
+        # Leaving usr.mount enabled would keep /usr overmounted at the next boot with
+        # nothing left to restore the WSL mounts below it.
+        leftover.append(usr_unit.name)
+    if not leftover:
+        return
+    if runner.dry_run:
+        info(f"[dry-run] Would disable and remove {', '.join(leftover)}")
+        return
+    runner.run("systemctl", ["disable", *leftover])
+    for unit in leftover:
+        (SYSTEMD_DIR / unit).unlink(missing_ok=True)
+    if usr_unit is not None and is_mountpoint("/usr"):
+        warn("the running system keeps the backup /usr until the next boot")
+
+
+def _generate_boot_units(config: Config, runner: CommandRunner) -> None:
+    with_usr = usr_subvol_name(config) is not None
+    if with_usr:
+        _write(
+            SYSTEMD_DIR / systemd.USR_PRE_UNIT,
+            systemd.generate_usr_pre(config),
+            runner,
+        )
+        _write(
+            SYSTEMD_DIR / systemd.USR_POST_UNIT,
+            systemd.generate_usr_post(config),
+            runner,
+        )
+    else:
+        _remove_boot_units(config, runner)
+    _write(systemd.USER_DROPIN_PATH, systemd.generate_user_dropin(config, with_usr), runner)
+
+
 def _setup_ext4_sync(
     config: Config, distribution: Distribution, config_path: str, runner: CommandRunner
 ) -> None:
@@ -110,6 +189,48 @@ def _setup_ext4_sync(
     _write(Path(hook_path), content, runner)
 
 
+def _install_targets(
+    config: Config, runner: CommandRunner, *, require_ext4: bool = True
+) -> list[Path]:
+    """Where every copy of the binary goes, verified to be the managed filesystems.
+
+    Below an unmounted base, writing the @usr copy would silently create a plain
+    directory on the ext4 root: the install would report success while the real
+    subvolume copy stays stale. The same is true for the copy on the ext4 root when
+    that mount point is not active, which is why that half can be skipped while the
+    ext4 mount unit is only about to be started.
+    """
+    targets = [Path("/usr/local/bin/wslarc")]
+    usr_subvol = usr_subvol_name(config)
+    if usr_subvol is None:
+        return targets
+    if config.uuid is None:
+        raise ValueError(f"UUID of {config.mount.base} is unknown; cannot install into it")
+    verify_mount(find_mount(config.mount.base), config.mount.base, "btrfs", config.uuid)
+    subvol_dir = Path(config.mount.base) / usr_subvol
+    if not subvol_dir.is_dir():
+        raise ValueError(f"{subvol_dir} is not a directory; refusing to install into it")
+    # An ordinary directory with the right name would swallow the copy just like an
+    # unmounted base does, so ask btrfs whether this really is the subvolume.
+    runner.run("btrfs", ["subvolume", "show", str(subvol_dir)])
+    targets.append(subvol_dir / "local/bin/wslarc")
+    if require_ext4:
+        # Boot-time `attach` and `boot-usr` run from the ext4 root, so it needs its own copy.
+        mount_point = config.ext4_sync.mount_point
+        if not is_mountpoint(mount_point):
+            raise ValueError(f"{mount_point} is not mounted; cannot update ext4")
+        mount_info = find_mount(mount_point)
+        if mount_info is None or mount_info.fstype != "ext4":
+            raise ValueError(f"{mount_point} is not an ext4 mount point; cannot update ext4")
+        root = find_mount("/")
+        if root is not None and root.fstype == "ext4" and mount_info.uuid != root.uuid:
+            # Another ext4 filesystem mounted here would take the copy that the boot
+            # step is supposed to read from the root filesystem.
+            raise ValueError(f"{mount_point} is not the ext4 root of this system")
+        targets.append(Path(mount_point) / "usr/local/bin/wslarc")
+    return targets
+
+
 def _install_binary(config: Config, runner: CommandRunner) -> None:
     if runner.dry_run:
         info("[dry-run] Would install wslarc to /usr/local/bin/wslarc")
@@ -117,26 +238,20 @@ def _install_binary(config: Config, runner: CommandRunner) -> None:
     source = Path(sys.argv[0]).resolve()
     if not source.is_file():
         raise ValueError(f"current wslarc executable is not a file: {source}")
-    targets = [Path("/usr/local/bin/wslarc")]
-    usr_subvol = usr_subvol_name(config)
-    if usr_subvol:
-        targets.append(Path(config.mount.base) / usr_subvol / "local/bin/wslarc")
+    targets = _install_targets(config, runner)
     install_copies(source, targets)
     success("wslarc binary installed")
 
 
 def systemctl_commands(config: Config, needs_ext4: bool) -> list[list[str]]:
-    commands = [
-        ["systemctl", "daemon-reload"],
-        ["systemctl", "enable", systemd.mount_unit_filename(config.mount.base)],
-    ]
+    commands = [["systemctl", "daemon-reload"]]
+    # usr.mount is enabled last, from run(): enabling it before the protection units
+    # exist would hide the WSL mounts below /usr at the next boot.
+    usr_unit = systemd.mount_unit_filename("/usr")
     commands.extend(
-        ["systemctl", "enable", systemd.mount_unit_filename(item.mount)]
-        for item in config.subvolumes.backup.values()
-    )
-    commands.extend(
-        ["systemctl", "enable", systemd.mount_unit_filename(item.mount)]
-        for item in config.subvolumes.transfer.values()
+        ["systemctl", "enable", unit]
+        for unit in systemd.managed_mount_units(config)
+        if unit != usr_unit
     )
     if needs_ext4:
         # The package hooks rsync into this mount, so it must be active now, not only after reboot.
@@ -174,9 +289,19 @@ def run(
     if not confirm_or_yes("Generate and install systemd units?", True, yes):
         print("Aborted.")
         return
-    _install_binary(config, runner)
+    if not runner.dry_run:
+        # Fail before writing or enabling anything when the base copy could not land on
+        # the managed filesystem. The ext4 copy is checked later, once its mount unit is
+        # started.
+        _install_targets(config, runner, require_ext4=False)
+        if needs_ext4:
+            # A previous install may have left usr.mount enabled. Disable it for the
+            # length of the re-install so a failure in the steps below cannot leave
+            # /usr overmounted without the units that restore what is hidden.
+            runner.run("systemctl", ["disable", systemd.mount_unit_filename("/usr")])
     _update_wsl_conf(config_path, runner)
     _generate_units(config, runner)
+    _generate_boot_units(config, runner)
     _write(BTRBK_CONF, btrbk.generate_config(config), runner)
     _write(SYSTEMD_DIR / "btrbk.service", btrbk.generate_service(config, config_path), runner)
     _write(SYSTEMD_DIR / "btrbk.timer", btrbk.generate_timer(config.btrbk.timer_schedule), runner)
@@ -184,4 +309,12 @@ def run(
         _setup_ext4_sync(config, distribution, config_path, runner)
     for command in systemctl_commands(config, needs_ext4):
         runner.run(command[0], command[1:])
+    # The ext4 mount unit is only active after the systemctl commands above.
+    _install_binary(config, runner)
+    if needs_ext4:
+        # Enable the boot units only once every copy of the binary they call exists,
+        # and enable usr.mount only after them: an enabled usr.mount without the units
+        # that protect it would hide the WSL mounts below /usr at the next boot.
+        runner.run("systemctl", ["enable", systemd.USR_PRE_UNIT, systemd.USR_POST_UNIT])
+        runner.run("systemctl", ["enable", systemd.mount_unit_filename("/usr")])
     success("Mount setup complete")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from wslarc.commands import hook_sync_systemd as hook
 from wslarc.config import Config, Distribution
 from wslarc.generators import hooks
 from wslarc.utils.block import PacmanPackage
+from wslarc.utils.shell import CommandError, CommandRunner
 
 
 def sample_hook_targets() -> list[str]:
@@ -258,7 +260,7 @@ def test_sync_debian_files_dry_run_has_no_side_effects(
     assert not (mount / hook.SYNC_MANIFEST).exists()
     output = capsys.readouterr().out
     assert "rsync" in output
-    assert "ldconfig" in output
+    assert "ldconfig" not in output
 
 
 def test_pacman_hook_targets_include_btrfs_progs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -387,3 +389,132 @@ def test_configured_extra_package_triggers_the_closure_sync(
     hook.run_with_triggered(config, Distribution.ARCH, False, ["btrbk"])
 
     assert synced == [["systemd", "btrbk"]]
+
+
+def sample_archive() -> hook.ArchArchive:
+    return hook.ArchArchive(
+        package("systemd", "1-1", "x86_64"),
+        Path("/var/cache/pacman/pkg/systemd-1-1-x86_64.pkg.tar.zst"),
+        Path("/mnt/ext4-root/var/cache/pacman/pkg/systemd-1-1-x86_64.pkg.tar.zst"),
+    )
+
+
+def test_install_arch_packages_rebuilds_live_linker_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        hook,
+        "pacman_install_archives",
+        lambda root, paths: calls.append(("pacman", root)),
+    )
+    monkeypatch.setattr(
+        hook, "shell_run", lambda command, args: calls.append((command, *args)) or ""
+    )
+
+    hook.install_arch_packages("/mnt/ext4-root", [sample_archive()], dry_run=False)
+
+    # pacman's sysroot ldconfig rewrites the shared /etc/ld.so.cache from the
+    # ext4-only view, so the cache is rebuilt from the live view afterwards.
+    assert calls == [("pacman", "/mnt/ext4-root"), ("ldconfig", "-X")]
+
+
+def test_install_arch_packages_rebuilds_cache_when_pacman_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fail(root: str, paths: list[str]) -> None:
+        raise CommandError("boom")
+
+    monkeypatch.setattr(hook, "pacman_install_archives", fail)
+    monkeypatch.setattr(
+        hook, "shell_run", lambda command, args: calls.append((command, *args)) or ""
+    )
+
+    with pytest.raises(CommandError):
+        hook.install_arch_packages("/mnt/ext4-root", [sample_archive()], dry_run=False)
+
+    assert calls == [("ldconfig", "-X")]
+
+
+def test_install_arch_packages_dry_run_skips_ldconfig(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected(command: str, args: Sequence[str]) -> str:
+        raise AssertionError(f"dry run must not run {command}")
+
+    monkeypatch.setattr(hook, "shell_run", unexpected)
+    hook.install_arch_packages("/mnt/ext4-root", [sample_archive()], dry_run=True)
+
+
+def test_sync_debian_files_keeps_symlinked_path_components(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A merged-usr root has /lib as a symlink; rsync must not recreate it as a directory."""
+    host_file = tmp_path / "usr" / "lib" / "libsystemd.so"
+    host_file.parent.mkdir(parents=True)
+    host_file.write_text("lib")
+    mount_point = tmp_path / "ext4"
+    mount_point.mkdir()
+    calls: list[list[str]] = []
+
+    class FakeRunner(CommandRunner):
+        def run(self, command: str, args: Sequence[str] = (), **kwargs: object) -> str:  # type: ignore[override]
+            calls.append([command, *args])
+            return ""
+
+    monkeypatch.setattr(hook, "CommandRunner", lambda **kwargs: FakeRunner())
+    hook.sync_debian_files(
+        str(mount_point),
+        ["systemd"],
+        False,
+        version_for=lambda package: "256.5-1",
+        files_for=lambda package: [str(host_file)],
+        is_owned=lambda file: False,
+    )
+    assert calls == [
+        [
+            "rsync",
+            "-aAX",
+            "--relative",
+            "--no-implied-dirs",
+            str(host_file),
+            str(mount_point),
+        ]
+    ]
+
+
+def test_sync_arch_packages_repairs_the_cache_when_nothing_is_left_to_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retried hook must still repair the cache its previous attempt failed to rebuild."""
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(hook, "get_arch_package_metadata", lambda packages: [])
+    monkeypatch.setattr(hook, "select_arch_packages_to_install", lambda packages, query: [])
+    monkeypatch.setattr(
+        hook, "shell_run", lambda command, args: calls.append((command, *args)) or ""
+    )
+    hook.sync_arch_packages("/mnt/ext4-root", ["systemd"], dry_run=False)
+    assert calls == [("ldconfig", "-X")]
+
+
+def test_sync_arch_packages_dry_run_does_not_touch_the_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected(command: str, args: Sequence[str]) -> str:
+        raise AssertionError(f"dry run must not run {command}")
+
+    monkeypatch.setattr(hook, "get_arch_package_metadata", lambda packages: [])
+    monkeypatch.setattr(hook, "select_arch_packages_to_install", lambda packages, query: [])
+    monkeypatch.setattr(hook, "shell_run", unexpected)
+    hook.sync_arch_packages("/mnt/ext4-root", ["systemd"], dry_run=True)
+
+
+def test_rebuild_live_linker_cache_fails_the_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(command: str, args: Sequence[str]) -> str:
+        raise CommandError("ldconfig: read-only file system")
+
+    monkeypatch.setattr(hook, "shell_run", boom)
+    with pytest.raises(CommandError, match="could not rebuild the live linker cache"):
+        hook.rebuild_live_linker_cache()

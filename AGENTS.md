@@ -17,9 +17,11 @@
 
 ## Runtime Dependencies
 
-- `wslarc init`: `btrfs-progs`, `rsync`, and conditional `e2fsprogs`
+- `wslarc init`: `btrfs-progs`, `rsync`, `findmnt`, and conditional `e2fsprogs`
 - `wslarc mount`: `btrbk`
 - `wslarc snapshot *`: `btrbk`
+- `wslarc boot-usr`: `findmnt`, `mount`, `umount`, `systemctl`, `systemd-tmpfiles`,
+  and `ldconfig`
 
 Do not execute real VHDX attach, mount, rsync, snapshot, restore, or package-hook
 operations in unit tests.

@@ -16,7 +16,6 @@ from wslarc.utils.block import (
 class UnitStatus:
     unit_file_state: str
     active_state: str
-    result: str
 
 
 def read_unit_status(name: str) -> UnitStatus:
@@ -26,25 +25,14 @@ def read_unit_status(name: str) -> UnitStatus:
         except Exception:
             return "unknown"
 
-    return UnitStatus(get("UnitFileState"), get("ActiveState"), get("Result"))
+    return UnitStatus(get("UnitFileState"), get("ActiveState"))
 
 
-def is_failed_mount_status(status: UnitStatus) -> bool:
-    return status.active_state == "failed" or (
-        bool(status.result) and status.result not in {"success", "done"}
-    )
-
-
-def mount_unit_names(config: Config) -> list[str]:
-    names = [systemd.mount_unit_filename(config.mount.base)]
-    names.extend(
-        systemd.mount_unit_filename(item.mount) for item in config.subvolumes.backup.values()
-    )
-    names.extend(
-        systemd.mount_unit_filename(item.mount) for item in config.subvolumes.transfer.values()
-    )
+def managed_unit_names(config: Config) -> list[str]:
+    names = systemd.managed_mount_units(config)
     if any(item.mount == "/usr" for item in config.subvolumes.backup.values()):
         names.append(hooks.ext4_mount_unit_filename(config))
+        names.extend([systemd.USR_PRE_UNIT, systemd.USR_POST_UNIT])
     return sorted(set(names))
 
 
@@ -76,6 +64,6 @@ def run(config: Config, distribution: Distribution) -> None:
     for line in configured_subvolume_lines(config):
         print(f"  {line}")
     print("\nSystemd Services")
-    for unit in ["btrbk.timer", *mount_unit_names(config)]:
+    for unit in ["btrbk.timer", *managed_unit_names(config)]:
         status = read_unit_status(unit)
         print(f"  {unit}: {status.unit_file_state}, {status.active_state}")

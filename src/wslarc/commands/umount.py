@@ -18,17 +18,21 @@ def run(
     if not confirm_or_yes("Disable all mount units?", False, yes):
         print("Aborted.")
         return
-    units = [systemd.mount_unit_filename(config.mount.base)]
-    units.extend(
-        systemd.mount_unit_filename(item.mount) for item in config.subvolumes.backup.values()
-    )
-    units.extend(
-        systemd.mount_unit_filename(item.mount) for item in config.subvolumes.transfer.values()
-    )
+    units = systemd.managed_mount_units(config)
     if any(item.mount == "/usr" for item in config.subvolumes.backup.values()):
         units.append(hooks.ext4_mount_unit_filename(config))
+        # Installations that predate these units do not have them yet.
+        units.extend(
+            unit
+            for unit in (systemd.USR_PRE_UNIT, systemd.USR_POST_UNIT)
+            if (systemd.UNIT_DIR / unit).exists()
+        )
     for unit in sorted(set(units)):
         runner.run("systemctl", ["disable", unit])
         info(f"{unit} disabled")
+    if runner.dry_run:
+        info(f"[dry-run] Would remove {systemd.USER_DROPIN_PATH}")
+    else:
+        systemd.USER_DROPIN_PATH.unlink(missing_ok=True)
     runner.run("systemctl", ["disable", "btrbk.timer"])
     success("All mount units disabled")

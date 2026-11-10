@@ -31,7 +31,8 @@ from wslarc.utils.packages import (
     pacman_query_version,
 )
 from wslarc.utils.prompt import info, success, warn
-from wslarc.utils.shell import CommandRunner
+from wslarc.utils.shell import CommandError, CommandRunner
+from wslarc.utils.shell import run as shell_run
 
 GUARD = PACMAN_SYNC_GUARD_ENV
 SYNC_MANIFEST = ".wslarc-systemd-sync-manifest"
@@ -280,6 +281,10 @@ def sync_arch_packages(mount_point: str, packages: list[str], dry_run: bool) -> 
 
     if not packages_to_install:
         info("All target Arch packages are already current")
+        if not dry_run:
+            # A retried hook finds every package current, so this is the only place that
+            # repairs a shared cache the previous attempt failed to rebuild.
+            rebuild_live_linker_cache()
         return
 
     archives = resolve_arch_archives(
@@ -299,8 +304,7 @@ def get_arch_package_metadata(packages: list[str]) -> list[PacmanPackage]:
         host_package = pacman_query_package(package)
         if host_package is None:
             raise RuntimeError(
-                f"Required host Arch package {package} is no longer installed; "
-                "retaining sync retry"
+                f"Required host Arch package {package} is no longer installed; retaining sync retry"
             )
         metadata.append(host_package)
     return metadata
@@ -376,6 +380,22 @@ def sync_arch_cache(archives: list[ArchArchive], dry_run: bool) -> None:
         info(f"Copied {archive.source.name}")
 
 
+def rebuild_live_linker_cache(*, strict: bool = True) -> None:
+    """Rebuild `/etc/ld.so.cache` from the live view.
+
+    pacman runs ldconfig inside the ext4 sysroot before the PostTransaction hooks,
+    which rewrites the shared cache from the ext4-only view. A failure leaves the live
+    system without a correct cache, so it fails the hook (keeping the package retry)
+    unless the caller only wants best effort.
+    """
+    try:
+        shell_run("ldconfig", ["-X"])
+    except CommandError as exc:
+        if strict:
+            raise CommandError(f"could not rebuild the live linker cache: {exc}") from exc
+        warn(f"could not rebuild the live linker cache: {exc}")
+
+
 def install_arch_packages(mount_point: str, archives: list[ArchArchive], dry_run: bool) -> None:
     if not archives:
         info("No packages to sync")
@@ -389,8 +409,15 @@ def install_arch_packages(mount_point: str, archives: list[ArchArchive], dry_run
             f"into {mount_point}"
         )
         return
-    # The packages adapter handles legacy chroot and current sysroot path semantics.
-    pacman_install_archives(mount_point, package_paths)
+    try:
+        # The packages adapter handles legacy chroot and current sysroot path semantics.
+        pacman_install_archives(mount_point, package_paths)
+    except CommandError:
+        # pacman may already have rewritten the shared cache before it failed, but its
+        # failure is the one to report.
+        rebuild_live_linker_cache(strict=False)
+        raise
+    rebuild_live_linker_cache()
 
 
 def sync_debian_files(
@@ -414,15 +441,14 @@ def sync_debian_files(
     sync_files = [file for file in sorted(files) if dry_run or Path(file).exists()]
 
     for file in sync_files:
-        runner.run("rsync", ["-aAX", "--relative", file, mount_point])
+        # Without --no-implied-dirs rsync recreates every path component it did not
+        # copy, which on a merged-usr root replaces the /lib -> usr/lib symlink with a
+        # real directory.
+        runner.run("rsync", ["-aAX", "--relative", "--no-implied-dirs", file, mount_point])
 
     if not dry_run:
         remove_stale_files_with(mount_point, previous_files, sync_files, is_owned)
         write_manifest(manifest_path, sync_files)
-
-    # The ext4 root has its own linker cache. Rebuild it after the package
-    # files have been copied from the Btrfs-backed system.
-    runner.run("ldconfig", ["-r", mount_point])
 
 
 def is_syncable_file(path: str) -> bool:

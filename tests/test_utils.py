@@ -1,10 +1,13 @@
 from wslarc.utils.block import (
+    MountInfo,
+    mounts_under,
     parse_debian_depends,
     parse_debian_status_version,
     parse_findmnt_mounts,
     parse_pacman_depends,
     parse_pacman_package_info,
 )
+from wslarc.utils.systemd import parse_dependency_names, parse_unit_properties
 
 
 def test_findmnt_parser_flattens_children() -> None:
@@ -14,6 +17,45 @@ def test_findmnt_parser_flattens_children() -> None:
         '"source":"/dev/sda","fstype":"btrfs","options":"subvol=@usr"}]}]}'
     )
     assert [mount.target for mount in mounts] == ["/mnt/btrfs", "/usr"]
+
+
+def test_findmnt_parser_reads_flat_list_with_spaces() -> None:
+    # findmnt -J already resolves the octal escapes from mountinfo; JSON values
+    # contain literal characters such as spaces.
+    mounts = parse_findmnt_mounts(
+        '{"filesystems":['
+        '{"target":"/usr/bin/perf","source":"/dev/sdb[/perf/bin/perf]",'
+        '"fstype":"ext4","options":"ro"},'
+        '{"target":"/mnt/with space","source":"tmpfs","fstype":"tmpfs","options":"rw"}'
+        "]}"
+    )
+    assert [mount.target for mount in mounts] == ["/usr/bin/perf", "/mnt/with space"]
+
+
+def test_mounts_under_picks_topmost_of_a_stack_parents_first() -> None:
+    mounts = [
+        MountInfo("/usr/lib/wsl/lib", "old", "overlay", "rw"),
+        MountInfo("/usr/bin/perf", "/dev/sdb", "ext4", "ro"),
+        MountInfo("/usr", "/dev/sdd", "btrfs", "rw"),
+        MountInfo("/usr/lib/wsl/lib", "new", "overlay", "rw"),
+        MountInfo("/elsewhere/x", "tmpfs", "tmpfs", "rw"),
+    ]
+    found = mounts_under(mounts, "/usr")
+    assert [mount.target for mount in found] == ["/usr/bin/perf", "/usr/lib/wsl/lib"]
+    assert next(m for m in found if m.target == "/usr/lib/wsl/lib").source == "new"
+
+
+def test_systemd_output_parsers() -> None:
+    assert parse_dependency_names("b.service\n a.service\nb.service\n\n") == [
+        "a.service",
+        "b.service",
+    ]
+    blocks = parse_unit_properties("Id=a\nActiveState=active\n\nId=b\nActiveState=inactive\n")
+    assert blocks == [
+        {"Id": "a", "ActiveState": "active"},
+        {"Id": "b", "ActiveState": "inactive"},
+    ]
+    assert parse_unit_properties("") == []
 
 
 def test_package_parsers_match_rust_behavior() -> None:

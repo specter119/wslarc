@@ -24,7 +24,11 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
     )
     parser.add_argument("--version", action="version", version=f"wslarc {__version__}")
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{init,mount,umount,status,snapshot,restore,attach}",
+    )
 
     init = commands.add_parser(
         "init", help="initialize Btrfs VHDX and create subvolumes", parents=[sub_common]
@@ -48,8 +52,13 @@ def build_parser() -> argparse.ArgumentParser:
     restore = commands.add_parser("restore", help="restore from a snapshot", parents=[sub_common])
     restore.add_argument("-s", "--snapshot")
 
+    # Internal entry points for the generated APT/pacman hooks and boot units.
+    # No help= text: argparse only lists subparsers that have one, and the
+    # metavar above keeps them out of the usage line. Their own --help still works.
     hook = commands.add_parser(
-        "hook-sync-systemd", help="sync systemd packages to ext4", parents=[sub_common]
+        "hook-sync-systemd",
+        description="Sync systemd packages to ext4; called by the generated APT/pacman hooks.",
+        parents=[sub_common],
     )
     hook.add_argument("--dry-run", action="store_true")
     hook.add_argument("--apt-pre", action="store_true", help=argparse.SUPPRESS)
@@ -57,6 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "attach", help="attach Btrfs VHDX if not already mounted", parents=[sub_common]
     )
+    boot_usr = commands.add_parser(
+        "boot-usr",
+        description="Preserve WSL mounts under /usr at boot; called by the generated boot units.",
+        parents=[sub_common],
+    )
+    phase = boot_usr.add_mutually_exclusive_group(required=True)
+    phase.add_argument("--pre", action="store_true", help="stash mounts before /usr is mounted")
+    phase.add_argument("--post", action="store_true", help="restore mounts and reload systemd")
     return parser
 
 
@@ -67,6 +84,14 @@ def _load_config(path: str, command: str, distribution: Distribution) -> Config:
 
 
 def run(args: argparse.Namespace) -> None:
+    if args.command == "boot-usr":
+        from wslarc.commands import boot_usr
+
+        if args.pre:
+            boot_usr.run_pre()
+        else:
+            boot_usr.run_post()
+        return
     distribution = Distribution.detect()
     config = _load_config(args.config, args.command, distribution)
     if args.command == "init":

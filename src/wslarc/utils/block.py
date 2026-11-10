@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -148,6 +149,34 @@ def is_mountpoint(path: str) -> bool:
 def find_mount_uuid(path: str) -> str | None:
     mount = find_mount(path)
     return mount.uuid if mount else None
+
+
+def list_mounts() -> list[MountInfo]:
+    """List every mount in mount-table order, including stacked and occluded ones."""
+    return parse_findmnt_mounts(
+        run("findmnt", ["-J", "--list", "-o", "TARGET,SOURCE,FSTYPE,OPTIONS"])
+    )
+
+
+def mounts_under(mounts: list[MountInfo], prefix: str) -> list[MountInfo]:
+    """Return the topmost mount for each target strictly below ``prefix``, parents first.
+
+    The input is in mount-table order (``findmnt --list``), so the last entry for a
+    target is the topmost of a mount stack. The result is stably sorted by path depth.
+    """
+    base = prefix.rstrip("/") + "/"
+    topmost: dict[str, MountInfo] = {}
+    for mount in mounts:
+        if mount.target.startswith(base):
+            topmost[mount.target] = mount
+    return sorted(topmost.values(), key=lambda mount: mount.target.count("/"))
+
+
+def mount_namespace_id(pid: int) -> str | None:
+    try:
+        return os.readlink(f"/proc/{pid}/ns/mnt")
+    except OSError:
+        return None
 
 
 def systemctl_property(unit: str, property_name: str) -> str:

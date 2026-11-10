@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import shlex
+import tempfile
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -12,9 +15,13 @@ from wslarc.config import Config, Distribution
 from wslarc.generators.invocation import shell_argument
 from wslarc.utils.block import (
     Dependency,
+    MountInfo,
     ensure_dependencies_for,
     find_btrfs_device_by_label,
+    is_mountpoint,
     list_block_device_names,
+    list_mounts,
+    mounts_under,
     read_block_device,
 )
 from wslarc.utils.prompt import (
@@ -27,7 +34,7 @@ from wslarc.utils.prompt import (
     success,
     warn,
 )
-from wslarc.utils.shell import CommandRunner
+from wslarc.utils.shell import CommandError, CommandRunner
 from wslarc.utils.windows import default_vhdx_path
 
 
@@ -205,7 +212,45 @@ def _make_plan_entry(
     )
 
 
+def _exclude_file_mounts(plan: list[SyncPlanEntry], mounts: list[MountInfo]) -> None:
+    """Keep file mounts below a source (the WSL /usr/bin/perf placeholder) out of the copy.
+
+    Directory mounts need no exclusion: rsync reads from a non-recursive bind view that
+    does not contain them. File mounts still need one, because the placeholder files
+    they hide (0 bytes on the ext4 root) would otherwise be copied into the subvolume.
+    """
+    for entry in plan:
+        prefix = entry.source.rstrip("/")
+        excluded = list(entry.excluded_paths)
+        for mount in mounts_under(mounts, prefix):
+            if Path(mount.target).is_dir():
+                continue
+            relative = mount.target[len(prefix) :].strip("/")
+            if relative not in excluded:
+                excluded.append(relative)
+        entry.excluded_paths = excluded
+
+
+def _exclude_args(paths: list[str]) -> list[str]:
+    args: list[str] = []
+    for path in paths:
+        args.extend(["--exclude", f"/{path.strip('/')}"])
+    return args
+
+
 def build_sync_plan(
+    config: Config,
+    mount_point: str,
+    first_init: bool,
+    dry_run: bool,
+    mounts: list[MountInfo] | None = None,
+) -> list[SyncPlanEntry]:
+    plan = _build_sync_plan(config, mount_point, first_init, dry_run)
+    _exclude_file_mounts(plan, list_mounts() if mounts is None else mounts)
+    return plan
+
+
+def _build_sync_plan(
     config: Config, mount_point: str, first_init: bool, dry_run: bool
 ) -> list[SyncPlanEntry]:
     base = Path(mount_point)
@@ -326,8 +371,10 @@ def render_resume_command(device: str, pending: list[SyncPlanEntry]) -> str | No
     lines = [
         "set -e",
         "resume_root=$(mktemp -d /tmp/wslarc-resume.XXXXXX)",
-        'cleanup() { sudo umount "$resume_root" >/dev/null 2>&1 || true; '
-        'rmdir "$resume_root" 2>/dev/null || true; }',
+        "source_view=$(mktemp -d /tmp/wslarc-source.XXXXXX)",
+        'cleanup() { sudo umount "$source_view" >/dev/null 2>&1 || true; '
+        'sudo umount "$resume_root" >/dev/null 2>&1 || true; '
+        'rmdir "$source_view" "$resume_root" 2>/dev/null || true; }',
         "trap cleanup EXIT",
         f'sudo mount -o subvolid=5 {shell_argument(device)} "$resume_root"',
     ]
@@ -335,29 +382,71 @@ def render_resume_command(device: str, pending: list[SyncPlanEntry]) -> str | No
         args = ["sudo", "rsync", "-aAX", "--partial", "--info=progress2"]
         if entry.kind is SyncKind.SNAPSHOT_ONLY:
             args.append("--delete")
-        for path in entry.excluded_paths:
-            args.extend(["--exclude", f"/{path.strip('/')}/"])
-        args.extend([f"{entry.source.rstrip('/')}/", f'"$resume_root"/{entry.subvol.rstrip("/")}/'])
+        args.extend(_exclude_args(entry.excluded_paths))
+        subvol = shell_argument(entry.subvol.rstrip("/"))
+        args.extend(['"$source_view"/', f'"$resume_root"/{subvol}/'])
+        lines.append(f'sudo mount --bind -o ro {shell_argument(entry.source)} "$source_view"')
         lines.append(
-            " ".join(
-                shlex.quote(arg) if not arg.startswith('"$resume_root"') else arg for arg in args
-            )
+            " ".join(shlex.quote(arg) if not arg.startswith('"$') else arg for arg in args)
         )
+        lines.append('sudo umount "$source_view"')
     lines.append(
-        "# The temporary subvolume-5 mount is cleaned up automatically when this shell exits."
+        "# The temporary subvolume-5 mount and source views are cleaned up "
+        "automatically when this shell exits."
     )
     return "\n".join(lines) + "\n"
 
 
-def _run_sync_entry(entry: SyncPlanEntry, runner: CommandRunner) -> None:
+@contextlib.contextmanager
+def _source_view(
+    source: str, runner: CommandRunner, view_root: Path = Path("/run/wslarc")
+) -> Iterator[str]:
+    """Yield a read-only, non-recursive bind view of ``source`` for rsync to read.
+
+    The view hides every mount below the source (WSL drivers, GPU libraries, kernel
+    modules, container storage, managed Btrfs mounts), so none of that content is
+    copied; files hidden below file mounts stay visible. ``mount --bind -o ro``
+    (util-linux >= 2.39) clones the mount and marks only the clone read-only, so the
+    source itself stays read-write.
+    """
+    if runner.dry_run:
+        view = str(view_root / "init-source.<dry-run>")
+        runner.run("mount", ["--bind", "-o", "ro", source, view])
+        yield view
+        runner.run("umount", [view])
+        return
+    view_root.mkdir(parents=True, exist_ok=True)
+    view = tempfile.mkdtemp(prefix="init-source.", dir=view_root)
+    mounted = False
+    try:
+        runner.run("mount", ["--bind", "-o", "ro", source, view])
+        mounted = True
+        if not is_mountpoint(view):
+            # A snapshot-only entry runs rsync --delete; syncing from an empty
+            # directory left behind by a failed mount would wipe the target.
+            raise RuntimeError(f"{view} is not a mount point; refusing to rsync from it")
+        yield view
+    finally:
+        if mounted:
+            try:
+                runner.run("umount", [view])
+            except CommandError as exc:
+                warn(f"could not unmount {view}: {exc}")
+        with contextlib.suppress(OSError):
+            Path(view).rmdir()
+
+
+def _run_sync_entry(
+    entry: SyncPlanEntry, runner: CommandRunner, view_root: Path = Path("/run/wslarc")
+) -> None:
     args = ["-aAX", "--partial", "--info=progress2"]
     if entry.kind is SyncKind.SNAPSHOT_ONLY:
         args.append("--delete")
-    for path in entry.excluded_paths:
-        args.extend(["--exclude", f"/{path.strip('/')}/"])
-    args.extend([f"{entry.source.rstrip('/')}/", f"{entry.target.rstrip('/')}/"])
-    info(f"Syncing {entry.source} -> {entry.target}")
-    runner.run("rsync", args, stream=True)
+    args.extend(_exclude_args(entry.excluded_paths))
+    with _source_view(entry.source, runner, view_root) as view:
+        args.extend([f"{view}/", f"{entry.target.rstrip('/')}/"])
+        info(f"Syncing {entry.source} -> {entry.target}")
+        runner.run("rsync", args, stream=True)
     success(f"{entry.subvol} synced")
 
 
