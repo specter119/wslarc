@@ -61,9 +61,7 @@ def pacman_install_archives(root: str, archives: list[str]) -> None:
         env={**os.environ, PACMAN_SYNC_GUARD_ENV: "1"},
     )
     if result.returncode:
-        raise CommandError(
-            f"Command failed: pacman --sysroot {root} -U\n{result.stderr.strip()}"
-        )
+        raise CommandError(f"Command failed: pacman --sysroot {root} -U\n{result.stderr.strip()}")
 
 
 def pacman_query_depends(package: str) -> list[str]:

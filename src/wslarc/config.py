@@ -163,6 +163,7 @@ class Ext4SyncConfig:
     mount_point: str = "/mnt/ext4-root"
     extra_packages: list[str] = field(default_factory=list)
 
+
 def parse_extra_packages(raw: dict[str, Any]) -> list[str]:
     unknown = set(raw) - {"mount_point", "extra_packages"}
     if unknown:
